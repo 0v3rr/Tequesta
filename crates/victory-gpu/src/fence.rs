@@ -97,6 +97,41 @@ pub(crate) extern "system" fn completed(this: This) -> u64 {
 /// The title's `GetCompletedValue`.
 extern "system" fn completed_called(this: This) -> u64 {
     let value = completed(this);
+    #[cfg(windows)]
+    if crate::port_static::on() {
+        use std::cell::Cell;
+        thread_local! {
+            static POLL_STREAK: Cell<(usize, u64, u32)> = const { Cell::new((0, 0, 0)) };
+        }
+        POLL_STREAK.with(|cell| {
+            let (last_fence, last_val, streak) = cell.get();
+            let next_streak = if last_fence == this as usize && last_val == value {
+                streak.saturating_add(1)
+            } else {
+                1
+            };
+            cell.set((this as usize, value, next_streak));
+            if next_streak >= 128 {
+                let f = fence(this);
+                // SAFETY: `f.value` is a 64-bit aligned AtomicU64 inside a live Fence;
+                // `WaitOnAddress` wakes immediately on `WakeByAddressAll` in `fence::set`
+                // or after at most 1 ms.
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitOnAddress(
+                        (&raw const f.value).cast(),
+                        (&raw const value).cast(),
+                        8,
+                        1,
+                    );
+                }
+                crate::port_static::note_fence_yield();
+            } else if next_streak >= 32 && next_streak.is_multiple_of(16) {
+                // SAFETY: plain thread yield.
+                unsafe { windows_sys::Win32::System::Threading::SwitchToThread() };
+                crate::port_static::note_fence_yield();
+            }
+        });
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::polled(this as usize, value);
     value

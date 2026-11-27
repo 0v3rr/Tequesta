@@ -331,8 +331,11 @@ const WINDOW_MOST: u64 = 64;
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
 fn windows() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    match *ENV.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").map(|v| v == "1")) {
+        Some(v) => v,
+        None => crate::port_static::on(),
+    }
 }
 
 /// Whether indirect executions of one record are clamped in batches
@@ -363,12 +366,17 @@ fn windows() -> bool {
 /// time) are not held up by waits of ours. Off: whether the title has ways
 /// to wait that do not pass through its lists' methods is not known.
 fn batches() -> u8 {
-    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
-        Ok("0") => 0,
-        Ok("2") => 2,
-        _ => 1,
-    })
+    static ENV: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    match *ENV.get_or_init(|| {
+        std::env::var("VICTORY_INDIRECT_BATCH").ok().map(|v| match v.as_str() {
+            "0" => 0,
+            "2" => 2,
+            _ => 1,
+        })
+    }) {
+        Some(v) => v,
+        None => if crate::port_static::on() { 2 } else { 1 },
+    }
 }
 
 /// The records clamped by the pass opened last ([`batches`]).
@@ -394,6 +402,40 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
         .map(std::sync::Arc::downgrade)
         .collect();
     live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
+}
+
+struct StaticBind {
+    pso_raw: usize,
+    root_raw: usize,
+    heaps: [usize; 2],
+    list_epoch: u64,
+    tested_depth: usize,
+    tables_gen: u64,
+    views_gen: u64,
+    consts_gen: u64,
+    table_sigs: Few<(u64, u32, u64), 8>,
+    stage_tables: [([(u8, u32); 8], usize); 4],
+    all_static_indexed: bool,
+    has_memory: bool,
+    has_ambient_or_probe: bool,
+    stores: bool,
+    depth_read: bool,
+}
+
+#[inline]
+fn verify_table_sigs(sigs: &[(u64, u32, u64)]) -> bool {
+    for &(table, n, expected) in sigs {
+        let mut h = RecordHash::default();
+        for k in 0..n {
+            let at = table + u64::from(k) * 32;
+            // SAFETY: descriptor slots in title memory previously validated.
+            h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+        }
+        if h.0 != expected {
+            return false;
+        }
+    }
+    true
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -470,6 +512,11 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+    tables_gen: [u64; 2],
+    views_gen: [u64; 2],
+    consts_gen: [u64; 2],
+    last_bind: [Option<StaticBind>; 2],
+    direct_cache: Option<Box<[(u64, u64, u64, u64); 512]>>,
 }
 
 impl Drop for State {
@@ -1095,6 +1142,9 @@ impl State {
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
+        if crate::port_static::on() && self.topology_set && self.topology == topology {
+            return;
+        }
         self.topology = topology;
         self.topology_set = true;
         let host = match topology {
@@ -1122,9 +1172,18 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [usize::MAX; 2];
         self.host_heaps_set = false;
+        self.tables_gen[0] += 1;
+        self.tables_gen[1] += 1;
+        self.views_gen[0] += 1;
+        self.views_gen[1] += 1;
+        self.consts_gen[0] += 1;
+        self.consts_gen[1] += 1;
+        self.last_bind = [None, None];
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
+        self.tables_gen[0] += 1;
+        self.tables_gen[1] += 1;
         self.heaps = [0; 2];
         for &h in heaps {
             if !h.is_null() {
@@ -1143,14 +1202,17 @@ impl State {
     }
 
     pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
+        self.tables_gen[usize::from(compute)] += 1;
         set(self.roots(compute), slot, Root::Table(handle));
     }
 
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
+        self.views_gen[usize::from(compute)] += 1;
         set(self.roots(compute), slot, Root::View(address));
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
+        self.consts_gen[usize::from(compute)] += 1;
         let roots = self.roots(compute);
         let s = slot as usize;
         if !matches!(roots.get(s), Some(Root::Constants(_))) {
@@ -1687,8 +1749,93 @@ impl State {
             0
         };
         TESTED_DEPTH.set((tested, false));
-        let root = p.root.as_raw() as usize;
-        if self.host_roots[usize::from(compute)] != root {
+        let c_idx = usize::from(compute);
+        let pso_raw = p.pso.as_raw() as usize;
+        let root_raw = p.root.as_raw() as usize;
+        let static_on = crate::port_static::on();
+        if static_on
+            && self.host_heaps_set
+            && self.host_heaps == self.heaps
+            && self.host_pipeline == pso_raw
+            && self.host_roots[c_idx] == root_raw
+            && let Some(mut cached) = self.last_bind[c_idx].take()
+        {
+            if cached.pso_raw == pso_raw
+                && cached.root_raw == root_raw
+                && cached.heaps == self.heaps
+                && cached.list_epoch == list.epoch()
+                && cached.tested_depth == tested
+                && cached.tables_gen == self.tables_gen[c_idx]
+                && cached.views_gen == self.views_gen[c_idx]
+                && !cached.has_memory
+                && !cached.has_ambient_or_probe
+                && verify_table_sigs(&cached.table_sigs)
+            {
+                if cached.consts_gen == self.consts_gen[c_idx] {
+                    TESTED_DEPTH.set((tested, cached.depth_read));
+                    if cached.stores {
+                        list.twins_written();
+                    }
+                    self.last_bind[c_idx] = Some(cached);
+                    crate::port_static::note_bind_full();
+                    return true;
+                }
+                if cached.all_static_indexed {
+                    TESTED_DEPTH.set((tested, cached.depth_read));
+                    for (stage_idx, stage) in p.stages.iter().enumerate() {
+                        let t = stage.translated();
+                        if let Some((param, dwords)) = stage.user_data {
+                            let (ref st_arr, st_len) = cached.stage_tables[stage_idx];
+                            let made = &st_arr[..st_len];
+                            let mut room = [0u32; 64];
+                            let mut more = Vec::new();
+                            let values: &mut [u32] = match room.get_mut(..dwords as usize) {
+                                Some(values) => values,
+                                None => {
+                                    more.resize(dwords as usize, 0);
+                                    &mut more
+                                }
+                            };
+                            for u in &t.host.user_data {
+                                if let RootType::Other(kind) = u.root {
+                                    values[u.index as usize] =
+                                        self.host_word(compute, kind, u.slot, u.dword, None);
+                                    continue;
+                                }
+                                let fresh = made
+                                    .iter()
+                                    .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                                values[u.index as usize] = match fresh {
+                                    Some(&(_, offset)) => offset,
+                                    None => self.user_value(compute, u.slot, u.root, u.dword),
+                                };
+                            }
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                self.user.clear();
+                                self.user.extend_from_slice(values);
+                            }
+                            // SAFETY: an open list; `values` covers the parameter.
+                            unsafe {
+                                if compute {
+                                    l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                                } else {
+                                    l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                                }
+                            }
+                        }
+                    }
+                    cached.consts_gen = self.consts_gen[c_idx];
+                    if cached.stores {
+                        list.twins_written();
+                    }
+                    self.last_bind[c_idx] = Some(cached);
+                    crate::port_static::note_bind_const();
+                    return true;
+                }
+            }
+        }
+        if self.host_roots[c_idx] != root_raw {
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
@@ -1697,34 +1844,59 @@ impl State {
                     l.SetGraphicsRootSignature(&p.root);
                 }
             }
-            self.host_roots[usize::from(compute)] = root;
+            self.host_roots[c_idx] = root_raw;
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        if self.host_pipeline != pso_raw {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
+            self.host_pipeline = pso_raw;
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        let mut cache_sigs: Few<(u64, u32, u64), 8> = Few::default();
+        let mut cache_stages: [([(u8, u32); 8], usize); 4] = [([(0, 0); 8], 0); 4];
+        let mut cache_stage_idx = 0usize;
+        let mut cache_static = static_on && p.stages.len() <= 4;
+        let mut cache_has_mem = false;
+        let mut cache_has_amb = false;
+        let mut cache_stores = false;
+        let mut cache_depth_read = false;
         for stage in &p.stages {
             let t = stage.translated();
+            cache_stores |= t.stores;
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
             let t_tbl = prof.then(std::time::Instant::now);
-            let made = self.tables(list, &t.tables, compute);
+            let made = if cache_static {
+                self.tables_inner(list, &t.tables, compute, Some((&mut cache_sigs, &mut cache_static)))
+            } else {
+                self.tables(list, &t.tables, compute)
+            };
             if let Some(t0) = t_tbl {
                 DRAW_PROF[1].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
+                self.last_bind[c_idx] = None;
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
+            if cache_static && made.len() <= 8 && cache_stage_idx < 4 {
+                let mut arr = [(0u8, 0u32); 8];
+                for (dst, &m) in arr.iter_mut().zip(made.iter()) {
+                    *dst = m;
+                }
+                cache_stages[cache_stage_idx] = (arr, made.len());
+                cache_stage_idx += 1;
+            } else {
+                cache_static = false;
+            }
             if stage.shader.ambient.is_some() || stage.shader.probe.is_some() {
+                cache_has_amb = true;
                 self.ambient_tables.clear();
                 self.ambient_tables.extend(made.iter().copied());
             }
@@ -1734,6 +1906,7 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                cache_has_mem = true;
                 // Only through a store by address: what it stores through
                 // views is declared with them.
                 let use_ = if crate::pipeline::is_builder(self.pipeline as This) || writes && t.stores_by_address {
@@ -1906,12 +2079,35 @@ impl State {
                     if let Some(t0) = t_roots {
                         DRAW_PROF[4].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                     }
+                    self.last_bind[c_idx] = None;
                     return false;
                 }
             }
             if let Some(t0) = t_roots {
                 DRAW_PROF[4].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
+            cache_depth_read |= TESTED_DEPTH.get().1;
+        }
+        if static_on && p.stages.len() <= 4 && !cache_has_mem && !cache_has_amb {
+            self.last_bind[c_idx] = Some(StaticBind {
+                pso_raw,
+                root_raw,
+                heaps: self.heaps,
+                list_epoch: list.epoch(),
+                tested_depth: tested,
+                tables_gen: self.tables_gen[c_idx],
+                views_gen: self.views_gen[c_idx],
+                consts_gen: self.consts_gen[c_idx],
+                table_sigs: cache_sigs,
+                stage_tables: cache_stages,
+                all_static_indexed: cache_static,
+                has_memory: false,
+                has_ambient_or_probe: false,
+                stores: cache_stores,
+                depth_read: cache_depth_read,
+            });
+        } else {
+            self.last_bind[c_idx] = None;
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
@@ -3482,7 +3678,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -3493,6 +3689,35 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        let use_cache = crate::port_static::on() && u.kind != ResourceType::Uav;
+        let mut cache_slot: Option<(usize, u64, u64, u64)> = None;
+        if use_cache {
+            // SAFETY: `handle` is inside `heap` (`heap.index(handle)` succeeded).
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            if tag == crate::descriptor::VIEW_TAG {
+                let rec_key = u64::from(generation) << 32 | u64::from(i);
+                let epoch = list.epoch();
+                let kind_bits = match u.kind {
+                    ResourceType::Cbv => 0u64,
+                    ResourceType::Srv => 1,
+                    ResourceType::Uav => 2,
+                    ResourceType::Sampler => 3,
+                    ResourceType::Other(x) => 4 + u64::from(x),
+                };
+                let meta = kind_bits
+                    | (u64::from(STORES.get()) << 4)
+                    | ((TESTED_DEPTH.get().0 as u64) << 8);
+                let idx = ((handle >> 5).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) as usize & 511;
+                if let Some(cache) = &self.direct_cache
+                    && cache[idx] == (handle, rec_key, epoch, meta)
+                {
+                    crate::port_static::note_direct_hit();
+                    return;
+                }
+                cache_slot = Some((idx, rec_key, epoch, meta));
+            }
+        }
+        let depth_before = TESTED_DEPTH.get().1;
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
@@ -3501,25 +3726,32 @@ impl State {
             } else {
                 host.slot_tabled(index);
             }
+            if let Some((idx, rec_key, epoch, meta)) = cache_slot
+                && TESTED_DEPTH.get().1 == depth_before
+            {
+                let cache = self
+                    .direct_cache
+                    .get_or_insert_with(|| Box::new([(0, 0, 0, 0); 512]));
+                cache[idx] = (handle, rec_key, epoch, meta);
+            }
         }
     }
 
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
-    ///
-    /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
+    ) -> Few<(u8, u32), 16> {
+        self.tables_inner(list, plan, compute, None)
+    }
+
+    fn tables_inner(
+        &mut self,
+        list: &HostList,
+        plan: &TablePlan,
+        compute: bool,
+        mut sigs_out: Option<(&mut Few<(u64, u32, u64), 8>, &mut bool)>,
     ) -> Few<(u8, u32), 16> {
         let prof_tbl = crate::host::perf_trace_on();
         let t_snap = prof_tbl.then(std::time::Instant::now);
@@ -3546,6 +3778,19 @@ impl State {
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
+                if let Some((sigs, all_static)) = &mut sigs_out {
+                    if let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(group.slot)) {
+                        let handle = table + u64::from(group.entries[e].table_offset_dwords) * 4;
+                        let mut h = RecordHash::default();
+                        // SAFETY: descriptor slot in title memory.
+                        h.add(unsafe { (handle as *const [u32; 3]).read_unaligned() });
+                        if sigs.len() < 8 {
+                            sigs.push((handle, 1, h.0));
+                        } else {
+                            **all_static = false;
+                        }
+                    }
+                }
                 self.table_entry(list, &group.entries[e], compute);
             }
         }
@@ -3628,6 +3873,13 @@ impl State {
                 }
                 (table, n, h.0)
             };
+            if let Some((sigs, all_static)) = &mut sigs_out {
+                if n > 64 || !selected.is_empty() || group.has_uav || sigs.len() >= 8 {
+                    **all_static = false;
+                } else {
+                    sigs.push(key);
+                }
+            }
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {

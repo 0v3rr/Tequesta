@@ -813,7 +813,53 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             continue;
         }
         let t0 = trace.then(std::time::Instant::now);
-        if !run_plain(op, list, w) {
+        let mut handled = false;
+        if op == Plain::EXECUTE_INDIRECT as u64 && len == 6 && crate::port_static::on() {
+            let (sig, max, arg_buf, arg_off, count_buf, count_off) = (
+                w[0] as This,
+                w[1] as u32,
+                w[2] as This,
+                w[3],
+                w[4] as This,
+                w[5],
+            );
+            if max == 1
+                && count_buf.is_null()
+                && count_off == 0
+                && let Some((stride, args)) = crate::signature::layout(sig)
+                && args.len() == 1
+                && stride > 0
+                && matches!(args[0][0], 0 | 1 | 2 | 10)
+            {
+                let mut fused = 1u64;
+                while fused < 64 && i < stream.len() {
+                    let (nop, nlen) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+                    if nop != Plain::EXECUTE_INDIRECT as u64 || nlen != 6 {
+                        break;
+                    }
+                    let nw = &stream[i + 1..i + 7];
+                    if nw[0] as This == sig
+                        && nw[1] as u32 == 1
+                        && nw[2] as This == arg_buf
+                        && nw[3] == arg_off + fused * u64::from(stride)
+                        && (nw[4] as This).is_null()
+                        && nw[5] == 0
+                    {
+                        i += 7;
+                        fused += 1;
+                        calls += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if fused > 1 {
+                    crate::port_static::note_indirect_fused(fused - 1);
+                }
+                super::execute_indirect(list, sig, fused as u32, arg_buf, arg_off, std::ptr::null(), 0);
+                handled = true;
+            }
+        }
+        if !handled && !run_plain(op, list, w) {
             let n = w.first().map_or(0, |&n| n as usize);
             match op {
                 RESET => {

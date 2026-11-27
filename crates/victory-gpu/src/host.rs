@@ -9548,10 +9548,11 @@ impl Meter {
                 perf_trace(format!("[TEQUESTA][1s]   {}", crate::list::thin::breakdown(frames)));
                 perf_trace(format!("[TEQUESTA][1s]   {}", crate::draw::breakdown(frames)));
                 perf_trace(format!(
-                    "[TEQUESTA][1s]   {} | {} | {}",
+                    "[TEQUESTA][1s]   {} | {} | {} | {}",
                     crate::descriptor::host::prof_breakdown(frames),
                     crate::descriptor::views_lock_breakdown(frames),
                     crate::shadow::exact_prof_breakdown(frames),
+                    crate::port_static::breakdown(frames),
                 ));
             }
             card_clock_line(frames, ms);
