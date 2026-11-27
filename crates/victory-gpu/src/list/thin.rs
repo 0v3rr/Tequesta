@@ -171,6 +171,10 @@ static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// recordings let go of in the middle.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Sub-timers (us) and counts per op group in `translate()` when `perf_trace_on()`:
+/// 0=draw/mesh, 1=dispatch, 2=indirect, 3=copy/resolve, 4=state/barriers/targets, 5=reset, 6=close, 7=other.
+static OP_US: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static OP_CNT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -305,7 +309,13 @@ fn back_list(kind: u32) -> This {
 }
 
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let default_threads = std::thread::available_parallelism()
+        .map_or(4, |n| (n.get() / 2).clamp(2, 8));
+    let threads = std::env::var("VICTORY_THIN_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default_threads)
+        .clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
@@ -349,19 +359,32 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
 }
 
 /// For the frame-rate line.
-pub(crate) fn line(frames: f64) {
+pub(crate) fn line(frames: f64) -> f64 {
     if !wanted() || !on() {
-        return;
+        return 0.0;
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    let ms = s[1] / 1000.0;
     tracing::info!(
         "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
         s[0],
-        s[1] / 1000.0,
+        ms,
         s[2],
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    ms
+}
+
+/// Per-op breakdown of `translate()` since the last frame line, when `perf_trace_on()`.
+pub(crate) fn breakdown(frames: f64) -> String {
+    let us = |i: usize| OP_US[i].swap(0, Relaxed) as f64 / 1000.0 / frames;
+    let cnt = |i: usize| OP_CNT[i].swap(0, Relaxed) as f64 / frames;
+    format!(
+        "thin_ops_ms(draw={:.1}/{:.0} disp={:.1}/{:.0} ind={:.1}/{:.0} copy={:.1}/{:.0} state={:.1}/{:.0} reset={:.1}/{:.0} close={:.1}/{:.0} other={:.1}/{:.0})",
+        us(0), cnt(0), us(1), cnt(1), us(2), cnt(2), us(3), cnt(3),
+        us(4), cnt(4), us(5), cnt(5), us(6), cnt(6), us(7), cnt(7),
+    )
 }
 
 #[inline]
@@ -708,11 +731,68 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+fn translate_bucket(op: u64) -> usize {
+    if op == Plain::DRAW as u64
+        || op == Plain::DRAW_INDEXED as u64
+        || op == Plain::DISPATCH_MESH as u64
+        || op == Plain::DISPATCH_MESH_X as u64
+    {
+        0
+    } else if op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64 {
+        1
+    } else if op == Plain::EXECUTE_INDIRECT as u64 {
+        2
+    } else if op == Plain::COPY_BUFFER as u64
+        || op == Plain::COPY_RESOURCE as u64
+        || op == Plain::COPY_RESOURCE_X as u64
+        || op == Plain::COPY_MEMORY as u64
+        || op == Plain::RESOLVE as u64
+        || op == COPY_TEXTURE
+    {
+        3
+    } else if op == Plain::SET_PIPELINE as u64
+        || op == Plain::TOPOLOGY as u64
+        || op == Plain::STENCIL_REF as u64
+        || op == Plain::DEPTH_BOUNDS as u64
+        || op == Plain::COMPUTE_TABLE as u64
+        || op == Plain::GRAPHICS_TABLE as u64
+        || op == Plain::COMPUTE_CONSTANT as u64
+        || op == Plain::GRAPHICS_CONSTANT as u64
+        || op == Plain::COMPUTE_VIEW as u64
+        || op == Plain::GRAPHICS_VIEW as u64
+        || matches!(
+            op,
+            BARRIER
+                | BARRIER_GROUPS
+                | VIEWPORTS
+                | SCISSORS
+                | BLEND_FACTOR
+                | HEAPS
+                | COMPUTE_CONSTANTS
+                | GRAPHICS_CONSTANTS
+                | INDEX_BUFFER
+                | VERTEX_BUFFERS
+                | TARGETS
+                | CLEAR_RTV
+                | CLEAR_DSV
+        )
+    {
+        4
+    } else if op == RESET {
+        5
+    } else if op == CLOSE {
+        6
+    } else {
+        7
+    }
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    let trace = crate::host::perf_trace_on();
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -732,84 +812,89 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
-        if run_plain(op, list, w) {
-            continue;
-        }
-        let n = w.first().map_or(0, |&n| n as usize);
-        match op {
-            RESET => {
-                // (Only whether there is an allocator is looked at.)
-                let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
-                super::reset(list, allocator, w[0] as This);
-            }
-            CLOSE => {
-                super::close(list);
-                closed = true;
-            }
-            BARRIER => {
-                super::barrier(list, n as u32, at_or(w, 1));
-            }
-            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
-            VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
-            SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
-            BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
-            HEAPS => state::heaps(list, n as u32, at(w, 1, n)),
-            COMPUTE_CONSTANTS => {
-                state::compute_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
-            }
-            GRAPHICS_CONSTANTS => {
-                state::graphics_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
-            }
-            INDEX_BUFFER => state::index_buffer(list, at(w, 1, n)),
-            VERTEX_BUFFERS => {
-                let views = if w[1] != 0 { at_or(w, 2) } else { std::ptr::null() };
-                state::vertex_buffers(list, w[0] as u32, (w[0] >> 32) as u32, views);
-            }
-            TARGETS => {
-                let mut handles = [0u64; 8];
-                let place = |k: usize| w[3 + k * RECORD..].as_ptr() as u64;
-                for (k, h) in handles.iter_mut().enumerate().take(n) {
-                    if w[1] >> k & 1 != 0 {
-                        *h = place(k);
-                    }
+        let t0 = trace.then(std::time::Instant::now);
+        if !run_plain(op, list, w) {
+            let n = w.first().map_or(0, |&n| n as usize);
+            match op {
+                RESET => {
+                    // (Only whether there is an allocator is looked at.)
+                    let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
+                    super::reset(list, allocator, w[0] as This);
                 }
-                let depth = if w[2] != 0 { place(n) } else { 0 };
-                state::targets(list, n as u32, handles.as_ptr(), 0, &depth);
+                CLOSE => {
+                    super::close(list);
+                    closed = true;
+                }
+                BARRIER => {
+                    super::barrier(list, n as u32, at_or(w, 1));
+                }
+                BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+                VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
+                SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
+                BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
+                HEAPS => state::heaps(list, n as u32, at(w, 1, n)),
+                COMPUTE_CONSTANTS => {
+                    state::compute_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
+                }
+                GRAPHICS_CONSTANTS => {
+                    state::graphics_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
+                }
+                INDEX_BUFFER => state::index_buffer(list, at(w, 1, n)),
+                VERTEX_BUFFERS => {
+                    let views = if w[1] != 0 { at_or(w, 2) } else { std::ptr::null() };
+                    state::vertex_buffers(list, w[0] as u32, (w[0] >> 32) as u32, views);
+                }
+                TARGETS => {
+                    let mut handles = [0u64; 8];
+                    let place = |k: usize| w[3 + k * RECORD..].as_ptr() as u64;
+                    for (k, h) in handles.iter_mut().enumerate().take(n) {
+                        if w[1] >> k & 1 != 0 {
+                            *h = place(k);
+                        }
+                    }
+                    let depth = if w[2] != 0 { place(n) } else { 0 };
+                    state::targets(list, n as u32, handles.as_ptr(), 0, &depth);
+                }
+                CLEAR_RTV => {
+                    super::clear_rtv(
+                        list,
+                        w[1..].as_ptr() as u64,
+                        at_or(w, 1 + RECORD),
+                        n as u32,
+                        at(w, 1 + RECORD + 2, n),
+                    );
+                }
+                CLEAR_DSV => {
+                    super::clear_dsv(
+                        list,
+                        w[3..].as_ptr() as u64,
+                        w[1] as u32,
+                        Word::unword(w[2]),
+                        (w[1] >> 32) as u8,
+                        n as u32,
+                        at(w, 3 + RECORD, n),
+                    );
+                }
+                COPY_TEXTURE => {
+                    let step = size_of::<CopyLocation>().div_ceil(8);
+                    let boxed = (w[1] >> 32) as usize;
+                    super::copy_texture_region(
+                        list,
+                        at_or(w, 2),
+                        w[0] as u32,
+                        (w[0] >> 32) as u32,
+                        w[1] as u32,
+                        at_or(w, 2 + step),
+                        at(w, 2 + 2 * step, boxed),
+                    );
+                }
+                _ => {}
             }
-            CLEAR_RTV => {
-                super::clear_rtv(
-                    list,
-                    w[1..].as_ptr() as u64,
-                    at_or(w, 1 + RECORD),
-                    n as u32,
-                    at(w, 1 + RECORD + 2, n),
-                );
-            }
-            CLEAR_DSV => {
-                super::clear_dsv(
-                    list,
-                    w[3..].as_ptr() as u64,
-                    w[1] as u32,
-                    Word::unword(w[2]),
-                    (w[1] >> 32) as u8,
-                    n as u32,
-                    at(w, 3 + RECORD, n),
-                );
-            }
-            COPY_TEXTURE => {
-                let step = size_of::<CopyLocation>().div_ceil(8);
-                let boxed = (w[1] >> 32) as usize;
-                super::copy_texture_region(
-                    list,
-                    at_or(w, 2),
-                    w[0] as u32,
-                    (w[0] >> 32) as u32,
-                    w[1] as u32,
-                    at_or(w, 2 + step),
-                    at(w, 2 + 2 * step, boxed),
-                );
-            }
-            _ => {}
+        }
+        if let Some(t0) = t0 {
+            let bucket = translate_bucket(op);
+            OP_US[bucket].fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+            OP_CNT[bucket].fetch_add(1, Relaxed);
         }
     }
     (calls, closed)

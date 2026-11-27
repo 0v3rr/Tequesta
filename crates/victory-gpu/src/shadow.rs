@@ -37,6 +37,7 @@ pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
+    base_offset: u64,
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
@@ -3004,6 +3005,7 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
+    trim_exact();
     const IDLE_FRAMES: u64 = 4;
     let budget = window_budget();
     let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
@@ -3153,7 +3155,12 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start + self.place.as_ref().map_or(0, |place| place.1)
+        address - self.start + self.base_offset + self.place.as_ref().map_or(0, |place| place.1)
+    }
+
+    /// Offset of this copy's first byte inside `self.buffer`.
+    pub(crate) fn buffer_offset(&self) -> u64 {
+        self.base_offset + self.place.as_ref().map_or(0, |place| place.1)
     }
 
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
@@ -3187,6 +3194,10 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        Self::new_at(buffer, data, gpu, 0, start, len)
+    }
+
+    fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, base_offset: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
@@ -3197,6 +3208,7 @@ impl Shadow {
             buffer,
             data,
             gpu,
+            base_offset,
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
@@ -5638,64 +5650,400 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
 /// bytes), each with the asking that last took it; and the askings so far.
-#[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+const EXACT_SHARDS: usize = 32;
+const EXACT_MAX_POOL: u64 = 1 << 20;
+const EXACT_ARENA_SIZE: u64 = 4 << 20;
+const EXACT_ARENA_MAX_SLICE: u64 = 256 << 10;
+
+struct ExactEntry {
+    shadow: Arc<Shadow>,
+    used: AtomicU64,
+    cap: u64,
+    arena: bool,
+}
+
+struct ExactShard {
+    map: std::collections::HashMap<
+        (u64, u64),
+        ExactEntry,
+        std::hash::BuildHasherDefault<crate::host::AddressHash>,
+    >,
+    since_sweep: u32,
+}
+
+struct PooledExact {
+    buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+}
+
+// SAFETY: persistently mapped D3D12 shared buffer owned exclusively by the pool.
+unsafe impl Send for PooledExact {}
+
+struct ExactPool {
+    buckets: std::collections::HashMap<u64, Vec<PooledExact>>,
+    bytes: u64,
+}
+
+struct ExactArena {
+    buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+    cursor: u64,
+    size: u64,
+}
+
+// SAFETY: persistently mapped D3D12 shared buffer; disjoint 256-byte slices
+// are handed out to individual `Shadow` copies.
+unsafe impl Send for ExactArena {}
+
+struct ExactArenaPool {
+    active: Option<ExactArena>,
+    waiting: Vec<ExactArena>,
+    total: usize,
+}
+
+static EXACT_TICK: AtomicU64 = AtomicU64::new(1);
+static EXACT_POOL: std::sync::OnceLock<Mutex<ExactPool>> = std::sync::OnceLock::new();
+static EXACT_ARENAS: std::sync::OnceLock<Mutex<ExactArenaPool>> = std::sync::OnceLock::new();
+
+fn exact_pool() -> &'static Mutex<ExactPool> {
+    EXACT_POOL.get_or_init(|| {
+        Mutex::new(ExactPool {
+            buckets: std::collections::HashMap::new(),
+            bytes: 0,
+        })
+    })
+}
+
+fn exact_arenas() -> &'static Mutex<ExactArenaPool> {
+    EXACT_ARENAS.get_or_init(|| {
+        Mutex::new(ExactArenaPool {
+            active: None,
+            waiting: Vec::new(),
+            total: 0,
+        })
+    })
+}
+
+fn exact_arena_alloc(alloc_len: u64, prof: bool) -> Option<(ID3D12Resource, *mut u8, u64, u64)> {
+    if alloc_len == 0 || alloc_len > EXACT_ARENA_MAX_SLICE {
+        return None;
+    }
+    let max_arenas = if crate::residency::limited_host_ram() { 32 } else { 64 };
+    {
+        let mut pool = exact_arenas().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(a) = pool.active.as_mut()
+            && a.cursor + alloc_len <= a.size
+        {
+            let off = a.cursor;
+            a.cursor += alloc_len;
+            if prof {
+                EXACT_PROF[1].fetch_add(1, Ordering::Relaxed);
+            }
+            return Some((a.buffer.clone(), (a.data + off as usize) as *mut u8, a.gpu + off, off));
+        }
+        if let Some(old) = pool.active.take() {
+            pool.waiting.push(old);
+        }
+        if let Some(idx) = pool
+            .waiting
+            .iter()
+            .position(|a| crate::host::references(&a.buffer) == 1)
+        {
+            let mut a = pool.waiting.swap_remove(idx);
+            a.cursor = alloc_len;
+            let res = (a.buffer.clone(), a.data as *mut u8, a.gpu, 0);
+            pool.active = Some(a);
+            if prof {
+                EXACT_PROF[1].fetch_add(1, Ordering::Relaxed);
+            }
+            return Some(res);
+        }
+        if pool.total >= max_arenas {
+            return None;
+        }
+        pool.total += 1;
+    }
+    let Some((buffer, data)) = host().and_then(|h| h.shared_buffer(EXACT_ARENA_SIZE)) else {
+        let mut pool = exact_arenas().lock().unwrap_or_else(|e| e.into_inner());
+        pool.total = pool.total.saturating_sub(1);
+        return None;
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::host::name(&buffer, || "title view arena 4MiB".to_string());
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if prof {
+        EXACT_PROF[2].fetch_add(1, Ordering::Relaxed);
+    }
+    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+    OWN_MADE.fetch_add(1, Ordering::Relaxed);
+    let fresh = ExactArena {
+        buffer: buffer.clone(),
+        data: data as usize,
+        gpu,
+        cursor: alloc_len,
+        size: EXACT_ARENA_SIZE,
+    };
+    {
+        let mut pool = exact_arenas().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = pool.active.replace(fresh) {
+            pool.waiting.push(prev);
+        }
+    }
+    Some((buffer, data, gpu, 0))
+}
+
+fn exact_shards() -> &'static [RwLock<ExactShard>; EXACT_SHARDS] {
+    static SHARDS: std::sync::OnceLock<[RwLock<ExactShard>; EXACT_SHARDS]> =
+        std::sync::OnceLock::new();
+    SHARDS.get_or_init(|| {
+        std::array::from_fn(|_| {
+            RwLock::new(ExactShard {
+                map: std::collections::HashMap::default(),
+                since_sweep: 0,
+            })
+        })
+    })
+}
+
+#[inline]
+fn exact_shard_idx(address: u64, len: u64) -> usize {
+    ((((address >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ len.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+        >> 59) as usize
+}
+
+fn exact_pool_take(cap: u64) -> Option<PooledExact> {
+    if cap == 0 || cap > EXACT_MAX_POOL {
+        return None;
+    }
+    let mut pool = exact_pool().lock().unwrap_or_else(|e| e.into_inner());
+    let buf = pool.buckets.get_mut(&cap)?.pop()?;
+    pool.bytes = pool.bytes.saturating_sub(cap);
+    Some(buf)
+}
+
+fn exact_pool_give(cap: u64, buf: PooledExact) {
+    if cap == 0 || cap > EXACT_MAX_POOL {
+        return;
+    }
+    let limit = if crate::residency::limited_host_ram() {
+        64 << 20
+    } else {
+        128 << 20
+    };
+    let mut pool = exact_pool().lock().unwrap_or_else(|e| e.into_inner());
+    if pool.bytes + cap <= limit {
+        pool.bytes += cap;
+        pool.buckets.entry(cap).or_default().push(buf);
+    }
+}
+
+fn trim_exact() {
+    let now = EXACT_TICK.load(Ordering::Relaxed);
+    let mut freed = Vec::new();
+    for shard in exact_shards() {
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
+        if guard.map.is_empty() {
+            continue;
+        }
+        let stale: Vec<(u64, u64)> = guard
+            .map
+            .iter()
+            .filter(|(_, e)| {
+                Arc::strong_count(&e.shadow) == 1
+                    && (e.arena || crate::host::references(&e.shadow.buffer) == 1)
+                    && e.used.load(Ordering::Relaxed) + 2048 <= now
+            })
+            .map(|(&k, _)| k)
+            .collect();
+        for k in stale {
+            if let Some(e) = guard.map.remove(&k) {
+                freed.push((e.shadow, e.cap, e.arena));
+            }
+        }
+    }
+    for (shadow, cap, arena) in freed {
+        if !arena && cap > 0 {
+            let buffer = shadow.buffer.clone();
+            let data = shadow.data as usize;
+            let gpu = shadow.gpu;
+            drop(shadow);
+            exact_pool_give(cap, PooledExact { buffer, data, gpu });
+        }
+    }
+    if crate::residency::pressured() {
+        {
+            let mut pool = exact_pool().lock().unwrap_or_else(|e| e.into_inner());
+            pool.buckets.clear();
+            pool.bytes = 0;
+        }
+        {
+            let mut arenas = exact_arenas().lock().unwrap_or_else(|e| e.into_inner());
+            let before = arenas.waiting.len();
+            arenas.waiting.retain(|a| crate::host::references(&a.buffer) > 1);
+            arenas.total = arenas.total.saturating_sub(before - arenas.waiting.len());
+        }
+    }
+}
 
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Sub-counters for `perf_trace_on()`: 0=hit, 1=pool_hit, 2=alloc_new, 3=total_us.
+static EXACT_PROF: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn exact_prof_breakdown(frames: f64) -> String {
+    let ask = EXACT_STATS[0].load(Ordering::Relaxed) as f64 / frames;
+    let hit = EXACT_PROF[0].swap(0, Ordering::Relaxed) as f64 / frames;
+    let pool = EXACT_PROF[1].swap(0, Ordering::Relaxed) as f64 / frames;
+    let new = EXACT_PROF[2].swap(0, Ordering::Relaxed) as f64 / frames;
+    let ms = EXACT_PROF[3].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
+    let kept: usize = exact_shards()
+        .iter()
+        .map(|s| s.read().unwrap_or_else(|e| e.into_inner()).map.len())
+        .sum();
+    format!("exact(ask={ask:.0} hit={hit:.0} pool={pool:.0} new={new:.0} kept={kept} ms={ms:.1})")
+}
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
 /// element of the copy its buffer has (`descriptor/host.rs` `view_home`).
-/// A host view counts its first element from its buffer's start; a console
-/// view starts at any address, and the title places views at ring
-/// positions inside its big GPU heap. Such a view was refused and its slot
-/// read zeros ("buffer view not on an element of its host copy", in every
-/// run; upstream VIctory 86a5ed6 found its meshlet culling constants and
-/// colour-bake parameter blocks among them and gives each a copy of its
-/// own bytes, as here).
-///
-/// The copy is brought up to date and written back like any other (a list
-/// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
-/// (start, bytes) for as long as a list or a slot holds it; of the others,
-/// those not asked for lately go once there are many (ring positions
-/// change every frame).
-pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
-    const MANY: usize = 256;
-    const LATELY: u64 = 512;
+pub(crate) fn exact(address: u64, len: u64, allow_arena: bool) -> Option<Arc<Shadow>> {
+    /// Copies kept per shard before batched eviction checks idle ones.
+    const MANY: usize = 64;
+    const LATELY: u64 = 2048;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
+    let prof = crate::host::perf_trace_on();
+    let t0 = prof.then(std::time::Instant::now);
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    let now = EXACT_TICK.fetch_add(1, Ordering::Relaxed);
+    let shard = &exact_shards()[exact_shard_idx(address, len)];
+    {
+        let guard = shard.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.map.get(&(address, len)) {
+            entry.used.store(now, Ordering::Relaxed);
+            let m = crate::host::moment();
+            if entry.shadow.used.load(Ordering::Relaxed) != m {
+                entry.shadow.used.store(m, Ordering::Relaxed);
+            }
+            if prof {
+                EXACT_PROF[0].fetch_add(1, Ordering::Relaxed);
+                if let Some(t0) = t0 {
+                    EXACT_PROF[3].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
+            }
+            return Some(entry.shadow.clone());
+        }
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
+    let alloc_len = len.next_multiple_of(256);
+    let (buffer, data, gpu, base_offset, cap, arena) =
+        if allow_arena && alloc_len <= EXACT_ARENA_MAX_SLICE
+            && let Some((buffer, data, gpu, base_offset)) = exact_arena_alloc(alloc_len, prof)
+        {
+            (buffer, data, gpu, base_offset, 0, true)
+        } else if alloc_len <= EXACT_MAX_POOL {
+            if let Some(pooled) = exact_pool_take(alloc_len) {
+                if prof {
+                    EXACT_PROF[1].fetch_add(1, Ordering::Relaxed);
+                }
+                (pooled.buffer, pooled.data as *mut u8, pooled.gpu, 0, alloc_len, false)
+            } else {
+                let (buffer, data) = host()?.shared_buffer(alloc_len)?;
+                #[cfg(feature = "diagnostics")]
+                crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                if prof {
+                    EXACT_PROF[2].fetch_add(1, Ordering::Relaxed);
+                }
+                EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+                OWN_MADE.fetch_add(1, Ordering::Relaxed);
+                (buffer, data, gpu, 0, alloc_len, false)
+            }
+        } else {
+            let (buffer, data) = host()?.shared_buffer(alloc_len)?;
+            #[cfg(feature = "diagnostics")]
+            crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            if prof {
+                EXACT_PROF[2].fetch_add(1, Ordering::Relaxed);
+            }
+            EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+            OWN_MADE.fetch_add(1, Ordering::Relaxed);
+            (buffer, data, gpu, 0, 0, false)
+        };
+    let new_shadow = Arc::new(Shadow::new_at(buffer, data, gpu, base_offset, address, len));
+    let mut freed = Vec::new();
+    let existing = {
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.map.get(&(address, len)) {
+            entry.used.store(now, Ordering::Relaxed);
+            Some(entry.shadow.clone())
+        } else {
+            guard.since_sweep += 1;
+            if guard.map.len() >= MANY && guard.since_sweep >= MANY as u32 {
+                guard.since_sweep = 0;
+                let stale: Vec<(u64, u64)> = guard
+                    .map
+                    .iter()
+                    .filter(|(_, e)| {
+                        Arc::strong_count(&e.shadow) == 1
+                            && (e.arena || crate::host::references(&e.shadow.buffer) == 1)
+                            && e.used.load(Ordering::Relaxed) + LATELY <= now
+                    })
+                    .map(|(&k, _)| k)
+                    .collect();
+                for k in stale {
+                    if let Some(e) = guard.map.remove(&k) {
+                        freed.push((e.shadow, e.cap, e.arena));
+                    }
+                }
+            }
+            guard.map.insert(
+                (address, len),
+                ExactEntry {
+                    shadow: new_shadow.clone(),
+                    used: AtomicU64::new(now),
+                    cap,
+                    arena,
+                },
+            );
+            None
+        }
+    };
+    for (shadow, c, is_arena) in freed {
+        if !is_arena && c > 0 {
+            let buffer = shadow.buffer.clone();
+            let d = shadow.data as usize;
+            let g = shadow.gpu;
+            drop(shadow);
+            exact_pool_give(c, PooledExact { buffer, data: d, gpu: g });
+        }
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
-    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
-    OWN_MADE.fetch_add(1, Ordering::Relaxed);
-    Some(shadow)
+    if let Some(existing) = existing {
+        if !arena && cap > 0 {
+            let buffer = new_shadow.buffer.clone();
+            let d = new_shadow.data as usize;
+            let g = new_shadow.gpu;
+            drop(new_shadow);
+            exact_pool_give(cap, PooledExact { buffer, data: d, gpu: g });
+        }
+        if let Some(t0) = t0 {
+            EXACT_PROF[3].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        return Some(existing);
+    }
+    if let Some(t0) = t0 {
+        EXACT_PROF[3].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    Some(new_shadow)
 }
 
 /// Copies of single views' bytes made since the start.
@@ -5709,7 +6057,10 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept: usize = exact_shards()
+        .iter()
+        .map(|s| s.read().unwrap_or_else(|e| e.into_inner()).map.len())
+        .sum();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",

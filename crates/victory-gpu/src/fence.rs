@@ -130,11 +130,11 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             FENCE_TRACE[1].fetch_add(settle_us, Ordering::Relaxed);
             if fence.value.load(Ordering::Acquire) >= value {
                 if settle_us >= 100_000 && crate::host::trace_frame_on() {
-                    eprintln!(
+                    crate::host::perf_trace(format!(
                         "[TEQUESTA][FENCE_BLOCK] value={} settle={:.1}ms woa=0.0ms timed_out=false",
                         value,
                         settle_us as f64 / 1000.0,
-                    );
+                    ));
                 }
                 return S_OK;
             }
@@ -149,12 +149,12 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
                     let woa_us = woa_t0.elapsed().as_micros() as u64;
                     FENCE_TRACE[2].fetch_add(woa_us, Ordering::Relaxed);
                     if settle_us + woa_us >= 100_000 && crate::host::trace_frame_on() {
-                        eprintln!(
+                        crate::host::perf_trace(format!(
                             "[TEQUESTA][FENCE_BLOCK] value={} settle={:.1}ms woa={:.1}ms timed_out=false",
                             value,
                             settle_us as f64 / 1000.0,
                             woa_us as f64 / 1000.0,
-                        );
+                        ));
                     }
                     return S_OK;
                 }
@@ -178,23 +178,23 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             FENCE_TRACE[2].fetch_add(woa_us, Ordering::Relaxed);
             if fence.value.load(Ordering::Acquire) >= value {
                 if settle_us + woa_us >= 100_000 && crate::host::trace_frame_on() {
-                    eprintln!(
+                    crate::host::perf_trace(format!(
                         "[TEQUESTA][FENCE_BLOCK] value={} settle={:.1}ms woa={:.1}ms timed_out=false",
                         value,
                         settle_us as f64 / 1000.0,
                         woa_us as f64 / 1000.0,
-                    );
+                    ));
                 }
                 return S_OK;
             }
             FENCE_TRACE[3].fetch_add(1, Ordering::Relaxed);
             if crate::host::trace_frame_on() {
-                eprintln!(
+                crate::host::perf_trace(format!(
                     "[TEQUESTA][FENCE_BLOCK] value={} settle={:.1}ms woa={:.1}ms timed_out=true",
                     value,
                     settle_us as f64 / 1000.0,
                     woa_us as f64 / 1000.0,
-                );
+                ));
             }
             tracing::warn!(value, "blocking fence wait timed out");
             return E_NOTIMPL;

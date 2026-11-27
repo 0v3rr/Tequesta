@@ -36,6 +36,9 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// A non-screen wait already hit the frame budget once; later frames
+    /// skip waiting until compilation finishes.
+    timed_out: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -127,6 +130,7 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -145,7 +149,7 @@ impl Pending {
             let made = if is_bad_key(&self.key) {
                 let n = SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
                 if n < 16 && crate::host::trace_frame_on() {
-                    eprintln!("[TEQUESTA][WARM_BAD] skipped key={} shaders={:?}", self.key, self.shaders);
+                    crate::host::perf_trace(format!("[TEQUESTA][WARM_BAD] skipped key={} shaders={:?}", self.key, self.shaders));
                 }
                 tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before");
                 None
@@ -366,13 +370,13 @@ fn lost(slot: usize) {
     };
     TRACE_WAIT[3].fetch_add(1, Ordering::Relaxed);
     if crate::host::trace_frame_on() {
-        eprintln!(
+        crate::host::perf_trace(format!(
             "[TEQUESTA][VEH] compiler_crashed key={} rip={:#x} addr={:#x} shaders={:?}",
             p.key,
             FAULT_RIP[slot].load(Ordering::Relaxed),
             FAULT_ADDR[slot].load(Ordering::Relaxed),
             p.shaders,
-        );
+        ));
     }
     tracing::error!(
         key = p.key,
@@ -455,18 +459,18 @@ fn wait_budget() -> Duration {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
+            .unwrap_or(60);
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })
 }
 
 /// As [`wait_budget`], for passes over the screen (`VICTORY_SCREEN_WAIT_MS`,
-/// 10 s; 0: like the others). Below the title's 30 s watchdog.
+/// 2.5 s; 0: like the others). Below the title's 30 s watchdog.
 fn screen_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000);
+        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2_500);
         Duration::from_millis(millis)
     })
 }
@@ -541,6 +545,9 @@ fn shared_budget() -> bool {
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
+    if !screen && p.timed_out.load(Ordering::Relaxed) {
+        return;
+    }
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
         return;
@@ -576,11 +583,14 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    if p.made.get().is_none() {
+        p.timed_out.store(true, Ordering::Relaxed);
+    }
     let elapsed_us = started.elapsed().as_micros() as u64;
     TRACE_WAIT[usize::from(screen)].fetch_add(elapsed_us, Ordering::Relaxed);
     TRACE_WAIT[2].fetch_add(1, Ordering::Relaxed);
-    if elapsed_us >= 200_000 && crate::host::trace_frame_on() {
-        eprintln!(
+    if elapsed_us >= 100_000 && crate::host::trace_frame_on() {
+        crate::host::perf_trace(format!(
             "[TEQUESTA][PIPE_WAIT] waited={:.1}ms screen={} made={} queue={} veh={} bad={} shaders={:?}",
             elapsed_us as f64 / 1000.0,
             screen,
@@ -589,7 +599,7 @@ fn wait(p: &Pending, frame: u64) {
             TRACE_WAIT[3].load(Ordering::Relaxed),
             SKIPPED_BAD.load(Ordering::Relaxed),
             p.shaders,
-        );
+        ));
     }
     let waited = started.elapsed().min(left);
     waiting.end();
@@ -766,12 +776,17 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
-        );
+        let asked = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok());
+        let processors = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let workers = match asked {
+            Some(_) => worker_count(asked, processors),
+            None if processors <= 8 || crate::residency::limited_host_ram() => {
+                (processors / 2).clamp(2, 6)
+            }
+            None => worker_count(None, processors),
+        };
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         guard_start();

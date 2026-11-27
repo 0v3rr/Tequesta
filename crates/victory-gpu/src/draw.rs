@@ -20,6 +20,23 @@ pub(crate) fn take_dyn_wait_stats() -> [u64; 2] {
     ]
 }
 
+/// Sub-timers (us) inside draw/dispatch/indirect translation when `perf_trace_on()`:
+/// 0=early_tex, 1=tables, 2=heap_buf, 3=memory_ready, 4=roots, 5=vbib_targets, 6=ind_clamp, 7=d3d_exec
+/// Counters: 8=fresh_hit, 9=fresh_miss, 10=listed_hit, 11=make_at_calls, 12=table_slots_total
+/// Tables breakdown (us): 13=t_dyn, 14=t_prep, 15=t_copy, 16=t_read, 17=t_hit, 18=t_direct, 19=t_pre
+static DRAW_PROF: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
+
+pub(crate) fn breakdown(frames: f64) -> String {
+    let ms = |i: usize| DRAW_PROF[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
+    let cnt = |i: usize| DRAW_PROF[i].swap(0, Ordering::Relaxed) as f64 / frames;
+    format!(
+        "draw_ms(early={:.1} tables={:.1} hbuf={:.1} mem={:.1} roots={:.1} vbib={:.1} clamp={:.1} d3d={:.1}) tbl(hit={:.0} miss={:.0} listed={:.0} make={:.0} slots={:.0}) tbl_ms(dyn={:.1} prep={:.1} copy={:.1} read={:.1} hit={:.1} dir={:.1} pre={:.1})",
+        ms(0), ms(1), ms(2), ms(3), ms(4), ms(5), ms(6), ms(7),
+        cnt(8), cnt(9), cnt(10), cnt(11), cnt(12),
+        ms(13), ms(14), ms(15), ms(16), ms(17), ms(18), ms(19),
+    )
+}
+
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
@@ -439,6 +456,8 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// Per-list bump slab in the current view heap: `(heap_ptr, next_slot, remaining)`.
+    dynamic_slab: (usize, u32, u32),
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -480,11 +499,54 @@ impl State {
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
         }
+        self.dynamic_slab = (0, 0, 0);
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+    }
+
+    /// Allocates `n` contiguous dynamic slots from the per-list bump slab,
+    /// fetching a 256-slot slab from `host` only when exhausted.
+    fn alloc_dynamic(
+        &mut self,
+        heap_ptr: usize,
+        host: &crate::descriptor::host::HostHeap,
+        n: u32,
+    ) -> Option<u32> {
+        if self.dynamic_slab.0 == heap_ptr && self.dynamic_slab.2 >= n {
+            let first = self.dynamic_slab.1;
+            self.dynamic_slab.1 += n;
+            self.dynamic_slab.2 -= n;
+            return Some(first);
+        }
+        const SLAB: u32 = 256;
+        let want = n.max(SLAB).min(host.dynamic_capacity());
+        let (base, got) = if let Some(base) = host.dynamic(want) {
+            (base, want)
+        } else if let Some(base) = host.dynamic(n) {
+            (base, n)
+        } else {
+            let t0 = std::time::Instant::now();
+            crate::host::wait_for_dynamic_slots();
+            let r = host
+                .dynamic(want)
+                .map(|b| (b, want))
+                .or_else(|| host.dynamic(n).map(|b| (b, n)))
+                .or_else(|| {
+                    crate::host::settle_for_fence();
+                    host.dynamic(n).map(|b| (b, n))
+                });
+            DYN_WAIT_TRACE[0].fetch_add(1, Ordering::Relaxed);
+            DYN_WAIT_TRACE[1].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            r?
+        };
+        self.dynamic.push((heap_ptr, base, got));
+        if got > n {
+            self.dynamic_slab = (heap_ptr, base + n, got - n);
+        }
+        Some(base)
     }
 }
 
@@ -1471,6 +1533,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        let prof_vbib = crate::host::perf_trace_on().then(std::time::Instant::now);
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1537,6 +1600,9 @@ impl State {
             };
             crate::list::ensure_state(list, self.depth as This, state);
         }
+        if let Some(t0) = prof_vbib {
+            DRAW_PROF[5].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         true
     }
 
@@ -1549,8 +1615,13 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        let prof = crate::host::perf_trace_on();
         // Textures picked by index, before anything asks for them.
+        let t_early = prof.then(std::time::Instant::now);
         self.early_textures(list, p, compute);
+        if let Some(t0) = t_early {
+            DRAW_PROF[0].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1643,7 +1714,11 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
+            let t_tbl = prof.then(std::time::Instant::now);
             let made = self.tables(list, &t.tables, compute);
+            if let Some(t0) = t_tbl {
+                DRAW_PROF[1].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1666,14 +1741,22 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
+                let t_mem = prof.then(std::time::Instant::now);
                 let Some(ready) = self.memory_ready(list, t, compute, use_) else {
+                    if let Some(t0) = t_mem {
+                        DRAW_PROF[3].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
+                if let Some(t0) = t_mem {
+                    DRAW_PROF[3].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 Some(ready)
             } else {
                 None
             };
+            let t_roots = prof.then(std::time::Instant::now);
             if let Some((param, dwords)) = stage.user_data {
                 // (A root signature holds 64 dwords.)
                 let mut room = [0u32; 64];
@@ -1733,6 +1816,7 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
+                        let t_hb = prof.then(std::time::Instant::now);
                         match self.heap_buffers(list) {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
@@ -1744,6 +1828,9 @@ impl State {
                                 }
                             },
                             None => once!("a shader picks buffers from a view heap that is not set"),
+                        }
+                        if let Some(t0) = t_hb {
+                            DRAW_PROF[2].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                         }
                         continue;
                     }
@@ -1816,8 +1903,14 @@ impl State {
                     }
                 };
                 if !self.root_uav(list, address, param, compute, writes) {
+                    if let Some(t0) = t_roots {
+                        DRAW_PROF[4].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                     return false;
                 }
+            }
+            if let Some(t0) = t_roots {
+                DRAW_PROF[4].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
         // Depth textures it writes through unordered access: their colour
@@ -1905,20 +1998,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    let t0 = std::time::Instant::now();
-                    crate::host::wait_for_dynamic_slots();
-                    let r = host.dynamic(1).or_else(|| {
-                        crate::host::settle_for_fence();
-                        host.dynamic(1)
-                    });
-                    DYN_WAIT_TRACE[0].fetch_add(1, Ordering::Relaxed);
-                    DYN_WAIT_TRACE[1].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    r
-                }) else {
+                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1986,20 +2068,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    let t0 = std::time::Instant::now();
-                    crate::host::wait_for_dynamic_slots();
-                    let r = host.dynamic(1).or_else(|| {
-                        crate::host::settle_for_fence();
-                        host.dynamic(1)
-                    });
-                    DYN_WAIT_TRACE[0].fetch_add(1, Ordering::Relaxed);
-                    DYN_WAIT_TRACE[1].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    r
-                }) else {
+                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -3316,7 +3387,11 @@ impl State {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
                     // SAFETY: an open list with everything set.
+                    let t_d3d = crate::host::perf_trace_on().then(std::time::Instant::now);
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    if let Some(t0) = t_d3d {
+                        DRAW_PROF[7].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -3446,6 +3521,8 @@ impl State {
         plan: &TablePlan,
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        let prof_tbl = crate::host::perf_trace_on();
+        let t_snap = prof_tbl.then(std::time::Instant::now);
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
@@ -3462,29 +3539,52 @@ impl State {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
         }
+        if let Some(t0) = t_snap {
+            DRAW_PROF[19].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        let t_dir = prof_tbl.then(std::time::Instant::now);
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
                 self.table_entry(list, &group.entries[e], compute);
             }
         }
+        if let Some(t0) = t_dir {
+            DRAW_PROF[18].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         let mut made = Few::default();
         for group in &plan.groups {
+            let t_pre = prof_tbl.then(std::time::Instant::now);
             let slot = group.slot;
             if !selected_slot(&fresh, slot) {
+                if let Some(t0) = t_pre {
+                    DRAW_PROF[19].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                if let Some(t0) = t_pre {
+                    DRAW_PROF[19].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 continue;
             };
             let entries = &group.entries;
             let Some(heap) = self.heap_of(table) else {
+                if let Some(t0) = t_pre {
+                    DRAW_PROF[19].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 continue;
             };
             if heap.samplers() || (table - heap.start) % 32 != 0 {
+                if let Some(t0) = t_pre {
+                    DRAW_PROF[19].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 continue;
             }
             let Some(host) = heap.host() else {
+                if let Some(t0) = t_pre {
+                    DRAW_PROF[19].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 continue;
             };
             let mut selected: Vec<u32> = group
@@ -3509,8 +3609,15 @@ impl State {
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                if let Some(t0) = t_pre {
+                    DRAW_PROF[19].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 continue;
             }
+            if let Some(t0) = t_pre {
+                DRAW_PROF[19].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            let t_hash = prof_tbl.then(std::time::Instant::now);
             // The table and what its entries hold (record words).
             let key = {
                 let mut h = RecordHash::default();
@@ -3524,6 +3631,9 @@ impl State {
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
+                if prof_tbl {
+                    DRAW_PROF[8].fetch_add(1, Ordering::Relaxed);
+                }
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
@@ -3536,6 +3646,9 @@ impl State {
                         TESTED_DEPTH.set((reader.3, true));
                     }
                     made.push((slot, first * 32));
+                    if let Some(t0) = t_hash {
+                        DRAW_PROF[17].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                     continue;
                 }
                 let depth_before = TESTED_DEPTH.get();
@@ -3572,27 +3685,29 @@ impl State {
                     }
                 }
                 made.push((slot, first * 32));
+                if let Some(t0) = t_hash {
+                    DRAW_PROF[17].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                let t0 = std::time::Instant::now();
-                crate::host::wait_for_dynamic_slots();
-                let r = host.dynamic(n).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(n)
-                });
-                DYN_WAIT_TRACE[0].fetch_add(1, Ordering::Relaxed);
-                DYN_WAIT_TRACE[1].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-                r
-            }) else {
+            let t_dyn = prof_tbl.then(std::time::Instant::now);
+            let Some(first) = self.alloc_dynamic(std::ptr::from_ref(heap) as usize, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
+                if let Some(t0) = t_dyn {
+                    DRAW_PROF[13].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 made.push((slot, u32::MAX));
                 continue;
             };
+            if let Some(t0) = t_dyn {
+                DRAW_PROF[13].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            if prof_tbl {
+                DRAW_PROF[9].fetch_add(1, Ordering::Relaxed);
+                DRAW_PROF[12].fetch_add(u64::from(n), Ordering::Relaxed);
+            }
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3610,6 +3725,9 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            let frame = crate::frame::current();
+            let batch_copy = n <= 256 && !crate::port_cbv::on() && host.table_stage_ready();
+            let mut batch_srcs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 256];
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3618,8 +3736,30 @@ impl State {
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && !crate::descriptor::is_constant_record(words)
+                    && let Some(mut listed) = if batch_copy {
+                        let t_prep = prof_tbl.then(std::time::Instant::now);
+                        let res = host.prepare_listed(words, index);
+                        if let Some(t0) = t_prep {
+                            DRAW_PROF[14].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                        res.map(|(l, src)| {
+                            batch_srcs[k as usize] = src;
+                            l
+                        })
+                    } else {
+                        let t_prep = prof_tbl.then(std::time::Instant::now);
+                        let res = host.make_listed(recording, words, index);
+                        if let Some(t0) = t_prep {
+                            DRAW_PROF[14].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                        res
+                    }
                 {
+                    if prof_tbl {
+                        DRAW_PROF[10].fetch_add(1, Ordering::Relaxed);
+                    }
+                    let t_read = prof_tbl.then(std::time::Instant::now);
                     let kind = group
                         .entry(k)
                         .map(|u| u.kind)
@@ -3627,8 +3767,12 @@ impl State {
                     let was = (listed.ready, listed.tabled);
                     if let Some(kind) = kind {
                         let tested = TESTED_DEPTH.get();
-                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
-                            if listed.ready.2 {
+                        if kind == ResourceType::Srv
+                            && listed.ready.0 == recording
+                            && listed.ready.1 == list.epoch()
+                            && listed.ready.2 == tested.0
+                        {
+                            if listed.ready.3 {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
@@ -3637,15 +3781,15 @@ impl State {
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv {
-                                listed.ready = (list.epoch(), tested.0, depth);
+                                listed.ready = (recording, list.epoch(), tested.0, depth);
                             }
                         }
                     }
                     if let Some(title) = title_first
                         && listed.texture
-                        && listed.tabled != Some((title + k, kind.is_some()))
+                        && listed.tabled != Some((frame, title + k, kind.is_some()))
                     {
-                        listed.tabled = Some((title + k, kind.is_some()));
+                        listed.tabled = Some((frame, title + k, kind.is_some()));
                         host.texture_slot_tabled(title + k, kind.is_some());
                         if kind.is_some() {
                             host.mirror_after(list, title + k, table + u64::from(k) * 32);
@@ -3654,9 +3798,16 @@ impl State {
                     if was != (listed.ready, listed.tabled) {
                         crate::descriptor::host::note_listed(recording, words, listed);
                     }
+                    if let Some(t0) = t_read {
+                        DRAW_PROF[16].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                     continue;
                 }
+                if prof_tbl {
+                    DRAW_PROF[11].fetch_add(1, Ordering::Relaxed);
+                }
                 let used = group.entry(k);
+                let t_prep = prof_tbl.then(std::time::Instant::now);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
@@ -3666,6 +3817,9 @@ impl State {
                                 Some(shadow) => {
                                     if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
                                         crate::port_cbv::in_place(size);
+                                        if let Some(t0) = t_prep {
+                                            DRAW_PROF[14].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                                        }
                                         continue;
                                     }
                                     crate::port_cbv::copied(false);
@@ -3674,15 +3828,39 @@ impl State {
                             }
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
+                            if batch_copy {
+                                batch_srcs[k as usize] = host.stage_null(k, index).unwrap_or_default();
+                            } else {
+                                host.make_null(index);
+                            }
+                            if let Some(t0) = t_prep {
+                                DRAW_PROF[14].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                            }
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at(index, &buffer, gpu, size);
+                        if batch_copy {
+                            batch_srcs[k as usize] = host
+                                .stage_constant(k, index, &buffer, gpu, size)
+                                .unwrap_or_default();
+                        } else {
+                            host.constant_at(index, &buffer, gpu, size);
+                        }
+                        if let Some(t0) = t_prep {
+                            DRAW_PROF[14].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        if batch_copy {
+                            batch_srcs[k as usize] = host.stage_view(k, index, &view).unwrap_or_default();
+                        } else {
+                            host.make_at(index, &view);
+                        }
+                        if let Some(t0) = t_prep {
+                            DRAW_PROF[14].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                        let t_read = prof_tbl.then(std::time::Instant::now);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -3702,13 +3880,30 @@ impl State {
                                 host.mirror_after(list, title + k, table + u64::from(k) * 32);
                             }
                         }
+                        if let Some(t0) = t_read {
+                            DRAW_PROF[16].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
                     }
                     None => {
-                        host.make_null(index);
+                        if batch_copy {
+                            batch_srcs[k as usize] = host.stage_null(k, index).unwrap_or_default();
+                        } else {
+                            host.make_null(index);
+                        }
+                        if let Some(t0) = t_prep {
+                            DRAW_PROF[14].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
+                }
+            }
+            if batch_copy {
+                let t_copy = prof_tbl.then(std::time::Instant::now);
+                host.copy_table(first, &batch_srcs[..n as usize]);
+                if let Some(t0) = t_copy {
+                    DRAW_PROF[15].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
             }
             made.push((slot, first * 32));
@@ -3913,10 +4108,14 @@ impl State {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
+            let t_d3d = crate::host::perf_trace_on().then(std::time::Instant::now);
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            if let Some(t0) = t_d3d {
+                DRAW_PROF[7].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4090,6 +4289,8 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        let prof = crate::host::perf_trace_on();
+        let t_clamp = prof.then(std::time::Instant::now);
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
@@ -4181,6 +4382,9 @@ impl State {
                 (bounded, 0)
             }
         };
+        if let Some(t0) = t_clamp {
+            DRAW_PROF[6].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -4202,6 +4406,7 @@ impl State {
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
+        let t_d3d = prof.then(std::time::Instant::now);
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
@@ -4212,6 +4417,9 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        if let Some(t0) = t_d3d {
+            DRAW_PROF[7].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

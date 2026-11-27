@@ -957,6 +957,7 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    let _ = TRACE_START.get_or_init(std::time::Instant::now);
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -1013,7 +1014,7 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             if trace_frame_on() {
-                eprintln!("[TEQUESTA][ADAPTER] WARP (VICTORY_D3D12_WARP=1)");
+                perf_trace("[TEQUESTA][ADAPTER] WARP (VICTORY_D3D12_WARP=1)");
             }
             tracing::info!("host device on the software adapter (WARP)");
         } else {
@@ -1033,7 +1034,7 @@ fn create() -> windows::core::Result<Host> {
         // stopped (run 54, 08:32:01 to 08:32:06). Left as it is by default:
         // whether the card is slower with the shaders it then keeps is not
         // known.
-        if std::env::var_os("VICTORY_D3D12_BACKGROUND").is_some_and(|v| v == "0")
+        if std::env::var_os("VICTORY_D3D12_BACKGROUND").is_none_or(|v| v != "1")
             && let Ok(device6) = device.cast::<ID3D12Device6>()
         {
             let set = device6.SetBackgroundProcessingMode(
@@ -1042,7 +1043,7 @@ fn create() -> windows::core::Result<Host> {
                 None,
                 None,
             );
-            tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
+            tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND!=1)");
         }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
@@ -1087,7 +1088,7 @@ fn create() -> windows::core::Result<Host> {
             let name = String::from_utf16_lossy(&desc.Description);
             let software = (desc.Flags & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0;
             if trace_frame_on() {
-                eprintln!(
+                perf_trace(format!(
                     "[TEQUESTA][ADAPTER] name=\"{}\" vendor={:#06x} device={:#06x} vram={}MB software={} wave={}..{} d3d12_bg_off={}",
                     name.trim_end_matches('\0'),
                     desc.VendorId,
@@ -1096,10 +1097,10 @@ fn create() -> windows::core::Result<Host> {
                     software,
                     o1.WaveLaneCountMin,
                     o1.WaveLaneCountMax,
-                    std::env::var_os("VICTORY_D3D12_BACKGROUND").is_some_and(|v| v == "0"),
-                );
+                    std::env::var_os("VICTORY_D3D12_BACKGROUND").is_none_or(|v| v != "1"),
+                ));
                 if software {
-                    eprintln!("[TEQUESTA][WARN] SOFTWARE / WARP / Basic Render Driver adapter selected!");
+                    perf_trace("[TEQUESTA][WARN] SOFTWARE / WARP / Basic Render Driver adapter selected!");
                 }
             }
             tracing::info!(
@@ -3452,9 +3453,66 @@ pub(crate) fn settle_now(why: usize) {
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
 }
+static TRACE_START: OnceLock<std::time::Instant> = OnceLock::new();
+
+/// `[watch_us, refresh_us, card_before_us, heaps_wait_us, exec_us, present_us]`
+static SUBMIT_PARTS_US: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+static PRESENT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_PRESENT_HR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+pub(crate) fn perf_trace_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PERF_TRACE").is_some_and(|v| v == "1"))
+}
+
 pub(crate) fn trace_frame_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_FRAME").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        perf_trace_on() || std::env::var_os("VICTORY_TRACE_FRAME").is_some_and(|v| v == "1")
+    })
+}
+
+pub(crate) fn perf_trace(msg: impl AsRef<str>) {
+    if !trace_frame_on() {
+        return;
+    }
+    let elapsed = TRACE_START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64();
+    let line = format!("[+{elapsed:07.3}s] {}", msg.as_ref());
+    eprintln!("{line}");
+    if !perf_trace_on() {
+        return;
+    }
+    static FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let path = std::env::var("VICTORY_PERF_TRACE_FILE")
+            .unwrap_or_else(|_| r"C:\Games\Tequesta\perf_trace.log".to_owned());
+        if let Ok(f) = std::fs::File::create(&path) {
+            *FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+        }
+        let _ = std::thread::Builder::new()
+            .name("victory-perf-hb".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let (pipe_made, pipe_loaded) = crate::pipeline::counts();
+                perf_trace(format!(
+                    "[TEQUESTA][HB] submits={}/{} presents={} hr={:#x} draws={} pipe_q={} pipe_made={} pipe_loaded={}",
+                    STARTED.load(Ordering::Relaxed),
+                    FINISHED.load(Ordering::Relaxed),
+                    PRESENT_CALLS.load(Ordering::Relaxed),
+                    LAST_PRESENT_HR.load(Ordering::Relaxed) as u32,
+                    crate::draw::drawn(),
+                    crate::pipeline::making(),
+                    pipe_made,
+                    pipe_loaded,
+                ));
+            });
+    });
+    if let Some(ref mut f) = *FILE.lock().unwrap_or_else(|e| e.into_inner()) {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+        let _ = f.flush();
+    }
 }
 
 pub(crate) fn settle_for_fence() {
@@ -5844,6 +5902,9 @@ impl Host {
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        if this_submission == 1 {
+            perf_trace("[TEQUESTA][MILESTONE] first_submit");
+        }
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -5887,7 +5948,11 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
+            let watch_t0 = trace_frame_on().then(std::time::Instant::now);
             crate::watch::ask_once(&ranges);
+            if let Some(t0) = watch_t0 {
+                SUBMIT_PARTS_US[0].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
             #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
@@ -5917,6 +5982,7 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
+        let refresh_t0 = trace_frame_on().then(std::time::Instant::now);
         if refresh_front() {
             batch.refresh_front(runs, &parts);
         } else if ahead_of_writes() {
@@ -5959,6 +6025,9 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        if let Some(t0) = refresh_t0 {
+            SUBMIT_PARTS_US[1].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         split.part(3);
         stage.next("submit: copies in the card's memory");
@@ -5978,7 +6047,11 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
+        let card_t0 = trace_frame_on().then(std::time::Instant::now);
         let card = self.card_before(&declared, &picked, flown);
+        if let Some(t0) = card_t0 {
+            SUBMIT_PARTS_US[2].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -5998,6 +6071,9 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        if trace_frame_on() {
+            SUBMIT_PARTS_US[3].fetch_add(heaps_began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
@@ -6025,6 +6101,7 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            let exec_t0 = trace_frame_on().then(std::time::Instant::now);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
@@ -6034,6 +6111,9 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if let Some(t0) = exec_t0 {
+                SUBMIT_PARTS_US[4].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -9325,6 +9405,9 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    first_present: bool,
+    last_frame: std::time::Instant,
+    frame_us: Vec<u64>,
 }
 
 impl Meter {
@@ -9339,6 +9422,9 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            first_present: false,
+            last_frame: now,
+            frame_us: Vec::new(),
         }
     }
 
@@ -9363,6 +9449,13 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        if !self.first_present {
+            self.first_present = true;
+            perf_trace("[TEQUESTA][MILESTONE] first_present");
+        }
+        let dt_us = self.last_frame.elapsed().as_micros() as u64;
+        self.last_frame = std::time::Instant::now();
+        self.frame_us.push(dt_us);
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -9381,6 +9474,14 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        let mut frame_us = std::mem::take(&mut self.frame_us);
+        frame_us.sort_unstable();
+        let p99_ms = frame_us
+            .get(((frame_us.len() * 99) / 100).min(frame_us.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(0) as f64
+            / 1000.0;
+        let max_ms = frame_us.last().copied().unwrap_or(0) as f64 / 1000.0;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // The lines (every second, and more every 5 s: sorting, system
         // calls, some forty lines written) are made by a thread of ours
@@ -9421,13 +9522,14 @@ impl Meter {
             let fence_s = crate::fence::take_trace_stats();
             let dyn_s = crate::draw::take_dyn_wait_stats();
             let pipe_s = crate::pipeline::take_trace_stats();
+            let parts = [0, 1, 2, 3, 4, 5].map(|i| SUBMIT_PARTS_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
             if trace_frame_on() {
-                eprintln!(
-                    "[TEQUESTA][1s] {fps:.1}fps {ms:.1}ms/f | draws={draws:.0} drop={dropped:.0} | submit_cpu={cpu:.1}ms(copy={copy_ms:.1} tex={texture_ms:.1} other={:.1}) submit_gpu={gpu:.1}ms back={back_ms:.1}ms | q(busy={:.1} pres={:.1} room={:.1} drain={:.1})ms",
+                perf_trace(format!(
+                    "[TEQUESTA][1s] {fps:.1}fps {ms:.1}ms/f (p99={p99_ms:.1} max={max_ms:.1}) | draws={draws:.0} drop={dropped:.0} | submit_cpu={cpu:.1}ms(copy={copy_ms:.1} tex={texture_ms:.1} other={:.1}) submit_gpu={gpu:.1}ms back={back_ms:.1}ms | q(busy={:.1} pres={:.1} room={:.1} drain={:.1} wait={:.1} thin={:.1})ms",
                     (cpu - copy_ms - texture_ms).max(0.0),
-                    q_ms[0], q_ms[1], q_ms[2], q_ms[3],
-                );
-                eprintln!(
+                    q_ms[0], q_ms[1], q_ms[2], q_ms[3], q_ms[4], q_ms[5],
+                ));
+                perf_trace(format!(
                     "[TEQUESTA][1s]   settle_ms(sync={:.1} val={:.1} stale={:.1} read={:.1} most={:.1} fence={:.1}) | fence_blk(settle={:.1} woa={:.1} n={} to={}) | dyn_wait={:.1}ms(n={}) | pipe_wait={:.1}ms(norm={:.1} scr={:.1} n={} q={} veh={} bad={})",
                     late_w[WHY_SYNC], late_w[WHY_VALUE], late_w[WHY_STALE], late_w[WHY_READ], late_w[WHY_MOST], late_w[WHY_FENCE],
                     fence_s[1] as f64 / 1000.0 / frames, fence_s[2] as f64 / 1000.0 / frames, fence_s[0], fence_s[3],
@@ -9436,7 +9538,21 @@ impl Meter {
                     pipe_s[0] as f64 / 1000.0 / frames,
                     pipe_s[1] as f64 / 1000.0 / frames,
                     pipe_s[2], pipe_s[3], pipe_s[4], pipe_s[5],
-                );
+                ));
+                perf_trace(format!(
+                    "[TEQUESTA][1s]   parts_ms(watch={:.1} refresh={:.1} card_pre={:.1} heaps={:.1} exec={:.1} present={:.1})",
+                    parts[0], parts[1], parts[2], parts[3], parts[4], parts[5],
+                ));
+            }
+            if perf_trace_on() {
+                perf_trace(format!("[TEQUESTA][1s]   {}", crate::list::thin::breakdown(frames)));
+                perf_trace(format!("[TEQUESTA][1s]   {}", crate::draw::breakdown(frames)));
+                perf_trace(format!(
+                    "[TEQUESTA][1s]   {} | {} | {}",
+                    crate::descriptor::host::prof_breakdown(frames),
+                    crate::descriptor::views_lock_breakdown(frames),
+                    crate::shadow::exact_prof_breakdown(frames),
+                ));
             }
             card_clock_line(frames, ms);
             upq::line(frames);
@@ -9989,12 +10105,24 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            let present_t0 = trace_frame_on().then(std::time::Instant::now);
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if let Some(t0) = present_t0 {
+                SUBMIT_PARTS_US[5].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            PRESENT_CALLS.fetch_add(1, Ordering::Relaxed);
+            let prev_hr = LAST_PRESENT_HR.swap(status.0, Ordering::Relaxed);
+            if status.0 != prev_hr && status != windows::Win32::Foundation::S_OK && trace_frame_on() {
+                perf_trace(format!("[TEQUESTA][PRESENT_STATUS] hr={:#x}", status.0));
+            }
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
             }
             let presented = p.meter.record_present(p.hwnd, status);
+            if !presented && perf_trace_on() && status == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED {
+                p.meter.frame(p.hwnd);
+            }
             showing.end();
             if !presented { return None; }
             #[cfg(feature = "diagnostics")]
@@ -10037,6 +10165,9 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
+            if trace_frame_on() {
+                perf_trace(format!("[TEQUESTA][SWAPCHAIN] {}x{} format={} buffers={BUFFERS}", width, height, format.0));
+            }
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,

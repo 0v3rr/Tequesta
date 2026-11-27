@@ -1304,12 +1304,48 @@ fn words_for(view: View) -> [u32; 2] {
     views_write().entry(view)
 }
 
+static VIEWS_LOCK_PROF: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(windows)]
+pub(crate) fn views_lock_breakdown(frames: f64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let ms = |i: usize| VIEWS_LOCK_PROF[i].swap(0, Relaxed) as f64 / 1000.0 / frames;
+    let cnt = |i: usize| VIEWS_LOCK_PROF[i].swap(0, Relaxed) as f64 / frames;
+    format!(
+        "views_lock(r={:.1}ms/{:.0} w={:.1}ms/{:.0})",
+        ms(0), cnt(1), ms(2), cnt(3),
+    )
+}
+
+#[inline]
+pub(crate) fn is_constant_record(words: [u32; 3]) -> bool {
+    words[0] == VIEW_TAG && (words[2] >> KIND_SHIFT) == CONSTANT
+}
+
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    #[cfg(windows)]
+    let t0 = crate::host::perf_trace_on().then(std::time::Instant::now);
+    let g = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    #[cfg(windows)]
+    if let Some(t0) = t0 {
+        use std::sync::atomic::Ordering::Relaxed;
+        VIEWS_LOCK_PROF[0].fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+        VIEWS_LOCK_PROF[1].fetch_add(1, Relaxed);
+    }
+    g
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+    #[cfg(windows)]
+    let t0 = crate::host::perf_trace_on().then(std::time::Instant::now);
+    let g = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    #[cfg(windows)]
+    if let Some(t0) = t0 {
+        use std::sync::atomic::Ordering::Relaxed;
+        VIEWS_LOCK_PROF[2].fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+        VIEWS_LOCK_PROF[3].fetch_add(1, Relaxed);
+    }
+    g
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them

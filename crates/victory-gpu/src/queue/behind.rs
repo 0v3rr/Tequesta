@@ -274,8 +274,12 @@ impl<W: Work> Lane<W> {
                     } else {
                         // It stands at something the CPU may write without
                         // a call of ours.
+                        let wt0 = crate::host::trace_frame_on().then(Instant::now);
                         let (back, out) =
                             self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
+                        if let Some(wt0) = wt0 {
+                            WAIT_FOLDED_US.fetch_add(wt0.elapsed().as_micros() as u64, Relaxed);
+                        }
                         state = back;
                         if out.timed_out() {
                             break;
@@ -694,6 +698,7 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present.
 static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static WAIT_FOLDED_US: AtomicU64 = AtomicU64::new(0);
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -926,10 +931,11 @@ pub(super) fn present(
 }
 
 /// For the frame-rate line.
-pub(super) fn line(frames: f64) -> [f64; 4] {
+pub(super) fn line(frames: f64) -> [f64; 5] {
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64).collect();
     let ms = |i: usize| s[i] / 1000.0 / frames;
-    let out = [ms(BUSY), ms(AT_PRESENT), ms(ROOM), ms(DRAINING)];
+    let wait_ms = WAIT_FOLDED_US.swap(0, Relaxed) as f64 / 1000.0 / frames;
+    let out = [ms(BUSY), ms(AT_PRESENT), ms(ROOM), ms(DRAINING), wait_ms];
     tracing::info!(
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
          when one was added (at most {:.0}); that thread worked {:.1} ms; threads of the title waited {:.1} ms for room in the \

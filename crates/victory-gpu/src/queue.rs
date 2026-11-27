@@ -468,12 +468,13 @@ pub(crate) fn queued() -> u64 {
 
 /// For the frame-rate line.
 #[cfg(windows)]
-pub(crate) fn behind_line(frames: f64) -> [f64; 4] {
+pub(crate) fn behind_line(frames: f64) -> [f64; 6] {
     if behind::on() {
-        crate::list::thin::line(frames);
-        behind::line(frames)
+        let thin_ms = crate::list::thin::line(frames);
+        let b = behind::line(frames);
+        [b[0], b[1], b[2], b[3], b[4], thin_ms]
     } else {
-        [0.0; 4]
+        [0.0; 6]
     }
 }
 
