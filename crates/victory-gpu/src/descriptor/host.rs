@@ -3884,6 +3884,121 @@ fn default_typed_srv_desc(texture: &ID3D12Resource, format: u32) -> Option<D3D12
     Some(desc)
 }
 
+/// Builds a concrete default texture UAV description for a typeless host
+/// texture when the title passed `None` (whole-resource view).
+fn default_typed_uav_desc(
+    texture: &ID3D12Resource,
+    format: u32,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    let linear = crate::resource::SRGB
+        .iter()
+        .find(|&&(s, _)| s == format)
+        .map_or(format, |&(_, l)| l);
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT(linear as i32),
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            if d.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                };
+            } else {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+                desc.Anonymous.Texture1D = D3D12_TEX1D_UAV { MipSlice: 0 };
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            if d.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                    PlaneSlice: 0,
+                };
+            } else {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                desc.Anonymous.Texture2D = D3D12_TEX2D_UAV {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                };
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                MipSlice: 0,
+                FirstWSlice: 0,
+                WSize: u32::from(d.DepthOrArraySize),
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
+}
+
+/// Clamps UAV mip and array/depth slice indices to the host texture's bounds.
+fn clamp_uav_subresource(
+    texture: &ID3D12Resource,
+    desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC,
+) {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let max_mip = u32::from(d.MipLevels).saturating_sub(1);
+    let max_slices = u32::from(d.DepthOrArraySize).max(1);
+    match desc.ViewDimension {
+        D3D12_UAV_DIMENSION_TEXTURE1D => {
+            // SAFETY: active union variant matches `ViewDimension`.
+            let t = unsafe { &mut desc.Anonymous.Texture1D };
+            t.MipSlice = t.MipSlice.min(max_mip);
+        }
+        D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+            // SAFETY: active union variant matches `ViewDimension`.
+            let t = unsafe { &mut desc.Anonymous.Texture1DArray };
+            t.MipSlice = t.MipSlice.min(max_mip);
+            t.FirstArraySlice = t.FirstArraySlice.min(max_slices - 1);
+            let avail = max_slices - t.FirstArraySlice;
+            if t.ArraySize == u32::MAX || t.ArraySize == 0 || t.ArraySize > avail {
+                t.ArraySize = avail;
+            }
+        }
+        D3D12_UAV_DIMENSION_TEXTURE2D => {
+            // SAFETY: active union variant matches `ViewDimension`.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            t.MipSlice = t.MipSlice.min(max_mip);
+        }
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: active union variant matches `ViewDimension`.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            t.MipSlice = t.MipSlice.min(max_mip);
+            t.FirstArraySlice = t.FirstArraySlice.min(max_slices - 1);
+            let avail = max_slices - t.FirstArraySlice;
+            if t.ArraySize == u32::MAX || t.ArraySize == 0 || t.ArraySize > avail {
+                t.ArraySize = avail;
+            }
+        }
+        D3D12_UAV_DIMENSION_TEXTURE3D => {
+            // SAFETY: active union variant matches `ViewDimension`.
+            let t = unsafe { &mut desc.Anonymous.Texture3D };
+            t.MipSlice = t.MipSlice.min(max_mip);
+            let depth_at_mip = (max_slices >> t.MipSlice).max(1);
+            t.FirstWSlice = t.FirstWSlice.min(depth_at_mip - 1);
+            let avail = depth_at_mip - t.FirstWSlice;
+            if t.WSize == u32::MAX || t.WSize == 0 || t.WSize > avail {
+                t.WSize = avail;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -4811,7 +4926,19 @@ fn make_twinned(
                     desc = Some(view);
                     twin
                 }
-                None => texture,
+                None => {
+                    if let Some(d) = &mut desc {
+                        if d.Format.0 == 0
+                            && let Some(own_fmt) = crate::resource::view_format(resource)
+                        {
+                            d.Format = DXGI_FORMAT(own_fmt as i32);
+                        }
+                        clamp_uav_subresource(texture, d);
+                    } else if let Some(own_fmt) = crate::resource::view_format(resource) {
+                        desc = default_typed_uav_desc(texture, own_fmt);
+                    }
+                    texture
+                }
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
@@ -4934,6 +5061,21 @@ fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u3
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             // SAFETY: the member its dimension says.
             let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.TextureCube };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.TextureCubeArray };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE3D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture3D };
             clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
         }
         _ => {}

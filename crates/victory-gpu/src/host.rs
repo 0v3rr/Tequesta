@@ -2521,6 +2521,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Index in `copies` of the most recent coalescible `Step::Refresh` per
+    /// shadow since the last `title_written` / `GpuWrite` / `take_coming`.
+    last_refresh: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Ranges declared written by shaders since the list last wrote title
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
@@ -2567,6 +2570,7 @@ impl Deferred {
     /// date before them is not any more.
     fn title_written(&mut self) {
         self.refreshed.clear();
+        self.last_refresh.clear();
         self.gpu_written.clear();
         self.filled.clear();
     }
@@ -3374,6 +3378,82 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // before: hundreds of short runs each, at about 1.5 us a run.
         let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        return spans;
+    }
+    spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
+    spans
+}
+
+struct SubmitScan {
+    ask_ranges: Vec<(usize, usize)>,
+    stale_candidates: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    declared: Vec<Declared>,
+}
+
+/// Collects `ask_once` ranges, `stale_under_flights` candidates, and
+/// `declared_writes` across `runs` in a single lock+scan pass per list.
+fn scan_submit_runs(runs: &[&HostList], want_ask: bool, want_stale: bool) -> SubmitScan {
+    use std::sync::Arc;
+    let mut ask_spans: ByCopy<(usize, usize)> = ByCopy::default();
+    let mut stale_candidates: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut stale_places: ByCopy<Option<usize>> = ByCopy::default();
+    let mut declared: Vec<Declared> = Vec::new();
+    let mut declared_places: ByCopy<usize> = ByCopy::default();
+    let mut declared_seen =
+        std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
+
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::Refresh(shadow, address, len) => {
+                    let key = Arc::as_ptr(shadow) as usize;
+                    if want_ask && shadow.asked_ahead() {
+                        let span = ask_spans.entry(key).or_insert((*address, *address + *len));
+                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    }
+                    if want_stale {
+                        let place = stale_places.entry(key).or_insert_with(|| {
+                            shadow.writes_pending().then(|| {
+                                stale_candidates.push((shadow.clone(), *address, *address + *len));
+                                stale_candidates.len() - 1
+                            })
+                        });
+                        if let Some(i) = *place {
+                            let s = &mut stale_candidates[i];
+                            (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                        }
+                    }
+                }
+                Step::GpuWrite(shadow, address, len) => {
+                    let key = Arc::as_ptr(shadow) as usize;
+                    if declared_seen.insert((key, *address, *len)) {
+                        let i = *declared_places.entry(key).or_insert_with(|| {
+                            declared.push((shadow.clone(), Vec::new()));
+                            declared.len() - 1
+                        });
+                        declared[i].1.push((*address, *address + *len));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    SubmitScan {
+        ask_ranges: ask_spans.into_values().collect(),
+        stale_candidates,
+        declared,
+    }
+}
+
+fn filter_stale_under_flights(
+    mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    scanning_ns: u64,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    if late_exact() {
+        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        UNDER_SCAN.fetch_add(scanning_ns, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
     }
@@ -6110,27 +6190,20 @@ impl Host {
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
-        // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
-        if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
-                    }
-                }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+        // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges,
+        // gathered in one pass alongside `declared_writes` and `stale_under_flights`.
+        let ask_once_on = crate::watch::once();
+        let upcheck_on = upcheck::on();
+        let scan_t0 = std::time::Instant::now();
+        let scan = scan_submit_runs(runs, ask_once_on, behind && !upcheck_on);
+        let scan_ns = scan_t0.elapsed().as_nanos() as u64;
+        if ask_once_on {
+            let ranges = &scan.ask_ranges;
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
             let watch_t0 = trace_frame_on().then(std::time::Instant::now);
-            crate::watch::ask_once(&ranges);
+            crate::watch::ask_once(ranges);
             if let Some(t0) = watch_t0 {
                 SUBMIT_PARTS_US[0].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
@@ -6141,19 +6214,27 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if upcheck::on() {
+            if upcheck_on {
                 upcheck::order(runs);
                 if behind {
                     upcheck::reads(runs);
                 }
             }
-            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            let stale = if behind {
+                if upcheck_on {
+                    stale_under_flights(runs)
+                } else {
+                    filter_stale_under_flights(scan.stale_candidates, scan_ns)
+                }
+            } else {
+                Vec::new()
+            };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
-                self.settle_stale(&mut submitted, runs, stale, &ranges);
+                self.settle_stale(&mut submitted, runs, stale, ranges);
                 settled += settling.elapsed();
             }
-        } else if behind && !stale_under_flights(runs).is_empty() {
+        } else if behind && !filter_stale_under_flights(scan.stale_candidates, scan_ns).is_empty() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -6234,7 +6315,7 @@ impl Host {
         for (shadow, at, len) in &picked.written {
             shadow.writing(*at, *len);
         }
-        let declared = declared_writes(runs);
+        let declared = scan.declared;
         let card_t0 = trace_frame_on().then(std::time::Instant::now);
         let card = self.card_before(&declared, &picked, flown);
         if let Some(t0) = card_t0 {
@@ -7112,6 +7193,7 @@ impl HostList {
         };
         let found = coming.wait();
         let mut deferred = self.deferred();
+        deferred.last_refresh.clear();
         let at = at.min(deferred.copies.len());
         deferred
             .copies
@@ -7245,15 +7327,18 @@ impl HostList {
         } else {
             wanted
         };
-        self.changed_something();
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy.clone()));
+                self.changed_something();
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                if before != wanted {
+                    self.changed_something();
+                }
                 (before != wanted).then_some(before)
             }
         };
@@ -7328,7 +7413,7 @@ impl HostList {
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
-        if was != (u.needs, u.behind, u.writing) || copy || colour {
+        if was != (u.needs, u.behind, u.writing) || copy {
             self.changed_something();
         }
         // shortcut: the depth plane's twin is not drawn into the plane
@@ -7476,9 +7561,13 @@ impl HostList {
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let mut any = false;
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
             u.behind[0] = Some(true);
+            any = true;
+        }
+        if any {
             self.changed_something();
         }
     }
@@ -7886,11 +7975,25 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let shadow_ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        let key = (shadow_ptr, address, len);
         if deferred.refreshed.insert(key) {
+            if let Some(&idx) = deferred.last_refresh.get(&shadow_ptr)
+                && let Some(Step::Refresh(_, prev_addr, prev_len)) = deferred.copies.get_mut(idx)
+                && address <= prev_addr.saturating_add(*prev_len)
+                && *prev_addr <= address.saturating_add(len)
+            {
+                let new_start = (*prev_addr).min(address);
+                let new_end = prev_addr.saturating_add(*prev_len).max(address.saturating_add(len));
+                *prev_addr = new_start;
+                *prev_len = new_end - new_start;
+                return;
+            }
+            let idx = deferred.copies.len();
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+            deferred.last_refresh.insert(shadow_ptr, idx);
         }
     }
 
@@ -7906,7 +8009,9 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let shadow_ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        deferred.last_refresh.remove(&shadow_ptr);
+        let key = (shadow_ptr, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
         }

@@ -470,9 +470,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
     float3 was = unpack(light[p]);
-    // Filter magenta garbage probes left by uninitialized/corrupted memory on AMD.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
-    float left = dot(was, LUMA);
+    // And the bluer kind of it (blue over 2.5x green and over red): left as
+    // a faint violet by the line above. The sky's light keeps green above
+    // 0.4x blue, sunsets keep blue low, so neither is touched.
+    if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     // For `fresh` seconds after the light around jumped (a new room) the

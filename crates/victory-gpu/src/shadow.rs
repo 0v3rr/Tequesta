@@ -35,6 +35,7 @@ pub(crate) struct Shadow {
     /// The bytes of `buffer`, once asked.
     width: std::sync::OnceLock<u64>,
     pub(crate) buffer: ID3D12Resource,
+    uav_capable: bool,
     data: *mut u8,
     gpu: u64,
     base_offset: u64,
@@ -3199,6 +3200,10 @@ impl Shadow {
 
     fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, base_offset: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        // SAFETY: `buffer` is a live `ID3D12Resource`.
+        let uav_capable = (unsafe { buffer.GetDesc() }.Flags.0
+            & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0)
+            != 0;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
@@ -3206,6 +3211,7 @@ impl Shadow {
             landing: Default::default(),
             width: Default::default(),
             buffer,
+            uav_capable,
             data,
             gpu,
             base_offset,
@@ -3233,6 +3239,11 @@ impl Shadow {
             mapped: false,
             place: None,
         }
+    }
+
+    #[inline]
+    pub(crate) fn is_uav_capable(&self) -> bool {
+        self.uav_capable
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.

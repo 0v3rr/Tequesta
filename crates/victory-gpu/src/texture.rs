@@ -194,8 +194,11 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 /// it out for a copy (the same bytes: the texels are as wide), the written
 /// texture's layout first.
 struct Through {
+    source: usize,
     buffer: ID3D12Resource,
     parts: Vec<(
+        u32,
+        u32,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     )>,
@@ -238,27 +241,36 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
-        match map.get(&(placed as usize)) {
-            Some(through) => through.clone(),
+        let cached = map
+            .get(&(placed as usize))
+            .filter(|t| t.source == source as usize)
+            .cloned();
+        match cached {
+            Some(through) => through,
             None => {
                 // SAFETY: live textures.
                 let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
-                // Levels times layers (a volume's slices are one part).
-                let count = |d: &D3D12_RESOURCE_DESC| {
-                    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-                        1
-                    } else {
-                        u32::from(d.DepthOrArraySize)
-                    };
-                    u32::from(d.MipLevels) * layers
+                let src_mips = u32::from(of_from.MipLevels);
+                let dst_mips = u32::from(of_to.MipLevels);
+                let src_layers = if of_from.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                    1
+                } else {
+                    u32::from(of_from.DepthOrArraySize)
                 };
-                let parts = count(&of_from);
-                if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
+                let dst_layers = if of_to.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                    1
+                } else {
+                    u32::from(of_to.DepthOrArraySize)
+                };
+                let dst_parts = dst_mips.saturating_mul(dst_layers);
+                if dst_mips == 0
+                    || dst_layers == 0
+                    || dst_mips > src_mips
+                    || dst_layers > src_layers
+                    || dst_parts > ALIAS_PARTS
+                {
                     return false;
                 }
-                let mut rows = [(); 2]
-                    .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
-                let mut bytes = [0u64; 2];
                 let mut fd_from = of_from;
                 fd_from.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
                     crate::resource::concrete_copy_format(of_from.Format.0 as u32) as i32,
@@ -267,40 +279,70 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 fd_to.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
                     crate::resource::concrete_copy_format(of_to.Format.0 as u32) as i32,
                 );
-                // SAFETY: plain queries; the out pointers are ours and
-                // hold `parts` layouts each.
+                let (Some((_, blk_from)), Some((_, blk_to))) = (
+                    crate::resource::element(fd_from.Format.0 as u32),
+                    crate::resource::element(fd_to.Format.0 as u32),
+                ) else {
+                    return false;
+                };
+                let mut dst_rows =
+                    vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); dst_parts as usize];
+                let mut bytes_to = 0u64;
+                // SAFETY: plain query; `dst_rows` holds `dst_parts` layouts.
                 unsafe {
-                    host.device.GetCopyableFootprints(
-                        &fd_from,
-                        0,
-                        parts,
-                        0,
-                        Some(rows[0].as_mut_ptr()),
-                        None,
-                        None,
-                        Some(&mut bytes[0]),
-                    );
                     host.device.GetCopyableFootprints(
                         &fd_to,
                         0,
-                        parts,
+                        dst_parts,
                         0,
-                        Some(rows[1].as_mut_ptr()),
+                        Some(dst_rows.as_mut_ptr()),
                         None,
                         None,
-                        Some(&mut bytes[1]),
+                        Some(&mut bytes_to),
                     );
                 }
-                let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
-                    let (fa, fb) = (a.Footprint, b.Footprint);
-                    a.Offset == b.Offset
-                        && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
-                            == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
-                });
-                if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
+                if bytes_to == 0 {
                     return false;
                 }
-                let Some(buffer) = host.uav_buffer(bytes[0]) else {
+                let mut parts_vec = Vec::with_capacity(dst_parts as usize);
+                let mut total_bytes = bytes_to;
+                for layer in 0..dst_layers {
+                    for mip in 0..dst_mips {
+                        let dst_sub = layer * dst_mips + mip;
+                        let src_sub = layer * src_mips + mip;
+                        let dst_fp = dst_rows[dst_sub as usize];
+                        let mut src_fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                        let mut src_bytes = 0u64;
+                        // SAFETY: plain query for 1 subresource footprint.
+                        unsafe {
+                            host.device.GetCopyableFootprints(
+                                &fd_from,
+                                src_sub,
+                                1,
+                                dst_fp.Offset,
+                                Some(&mut src_fp),
+                                None,
+                                None,
+                                Some(&mut src_bytes),
+                            );
+                        }
+                        let (fa, fb) = (src_fp.Footprint, dst_fp.Footprint);
+                        if src_bytes == 0
+                            || src_fp.Offset != dst_fp.Offset
+                            || fa.RowPitch != fb.RowPitch
+                            || fa.Depth != fb.Depth
+                            || u64::from(fa.Width).div_ceil(blk_from)
+                                != u64::from(fb.Width).div_ceil(blk_to)
+                            || u64::from(fa.Height).div_ceil(blk_from)
+                                != u64::from(fb.Height).div_ceil(blk_to)
+                        {
+                            return false;
+                        }
+                        total_bytes = total_bytes.max(dst_fp.Offset.saturating_add(src_bytes));
+                        parts_vec.push((src_sub, dst_sub, src_fp, dst_fp));
+                    }
+                }
+                let Some(buffer) = host.uav_buffer(total_bytes) else {
                     return false;
                 };
                 crate::host::name(&buffer, || {
@@ -314,15 +356,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                     texture = ?source,
                     width = of_from.Width,
                     height = of_from.Height,
-                    parts,
+                    parts = dst_parts,
                     written_as = of_from.Format.0,
                     read_as = of_to.Format.0,
                     "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
                 );
-                let [of_written, of_read] = rows;
                 let through = Arc::new(Through {
+                    source: source as usize,
                     buffer,
-                    parts: of_written.into_iter().zip(of_read).collect(),
+                    parts: parts_vec,
                 });
                 map.insert(placed as usize, through.clone());
                 through
@@ -377,15 +419,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     unsafe {
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
-        for (index, (of_written, _)) in through.parts.iter().enumerate() {
+        for (src_sub, _, of_written, _) in &through.parts {
             list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, *src_sub as usize), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
-        for (index, (_, of_read)) in through.parts.iter().enumerate() {
+        for (_, dst_sub, _, of_read) in &through.parts {
             list.list
-                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+                .CopyTextureRegion(&part(to, *dst_sub as usize), 0, 0, 0, &rows(of_read), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);

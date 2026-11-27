@@ -1579,15 +1579,35 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     let other = *targets.get(&(r.data() as u64))? as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
+    let dims_ok = o.desc.dimension == r.desc.dimension
+        && o.desc.mip_levels >= r.desc.mip_levels
+        && if r.desc.dimension == TEXTURE_3D {
+            o.desc.depth_or_array_size == r.desc.depth_or_array_size
+        } else {
+            o.desc.depth_or_array_size >= r.desc.depth_or_array_size
+        };
+    let compat_extent_and_format = match (element(o.desc.format), element(r.desc.format)) {
+        (Some((bo, blko)), Some((br, blkr))) if bo == br => {
+            if blko == blkr {
+                o.desc.width == r.desc.width && o.desc.height == r.desc.height
+            } else if blko == 1 && blkr == 4 {
+                o.desc.width == r.desc.width.div_ceil(4)
+                    && o.desc.height == r.desc.height.div_ceil(4)
+            } else if blko == 4 && blkr == 1 {
+                r.desc.width == o.desc.width.div_ceil(4)
+                    && r.desc.height == o.desc.height.div_ceil(4)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
     let same = one(&o.desc)
-        && o.desc.dimension == r.desc.dimension
-        && o.desc.width == r.desc.width
-        && o.desc.height == r.desc.height
-        && o.desc.mip_levels == r.desc.mip_levels
-        && o.desc.depth_or_array_size == r.desc.depth_or_array_size
+        && dims_ok
+        && compat_extent_and_format
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
-        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+        && host_resource(other).is_some();
     if !same && r.desc.sample_count <= 1 {
         // What shaders wrote there is on the card in the other texture; this
         // one is filled from title memory, which they never reached. Each
@@ -2613,9 +2633,16 @@ fn host_texture_as(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
-    // Title-filled textures in sRGB-castable formats (BC1/BC2/BC3/BC7/RGBA8/BGRA8)
-    // are created typeless so shaders can sample them as either UNORM or UNORM_SRGB.
-    if d.flags & (TARGET | DEPTH) == 0
+    // Title-filled textures (and single-slice/sample 2D render targets) in
+    // sRGB-castable formats (BC1/BC2/BC3/BC7/RGBA8/BGRA8) are created typeless
+    // so shaders can sample them as either UNORM or UNORM_SRGB without losing
+    // format conversion.
+    const TEXTURE_2D: u32 = 3;
+    if (d.flags & (TARGET | DEPTH) == 0
+        || (d.flags & DEPTH == 0
+            && d.dimension == TEXTURE_2D
+            && d.depth_or_array_size == 1
+            && d.sample_count <= 1))
         && clear.is_null()
         && typeless_srgb_on()
         && let Some(typeless) = srgb_castable_typeless(d.format)
@@ -3267,11 +3294,20 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if let Some(&other) = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner()).get(&address) {
         let other_ptr = other as This;
         let o = resource(other_ptr);
+        let req_layers = (desc[7] & 0xffff) as u16;
+        let req_mips = (desc[7] >> 16) as u16;
+        let o_fmt = pc_format(o.desc.format);
+        let d_fmt = pc_format(desc[8]);
+        let fmt_ok = family(o_fmt) == family(d_fmt)
+            || family(target_format(o_fmt)) == family(target_format(d_fmt));
         if o.desc.dimension == desc[0]
             && o.desc.width == (u64::from(desc[4]) | u64::from(desc[5]) << 32)
             && o.desc.height == desc[6]
-            && family(pc_format(o.desc.format)) == family(pc_format(desc[8]))
-            && ((o.desc.flags & ALLOW_UNORDERED_ACCESS) != 0 || twin(other_ptr).is_some())
+            && (req_mips == 0 || o.desc.mip_levels == 0 || o.desc.mip_levels >= req_mips)
+            && (req_layers == 0 || o.desc.depth_or_array_size >= req_layers)
+            && fmt_ok
+            && (((o.desc.flags & ALLOW_UNORDERED_ACCESS) != 0 && host_resource(other_ptr).is_some())
+                || twin(other_ptr).is_some())
         {
             return Some(other_ptr);
         }
