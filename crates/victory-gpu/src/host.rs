@@ -168,17 +168,17 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
-    const SHORT_MS: u64 = 3_000;
+    const SHORT_MS: u64 = 1_500;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(85) {
+    if used < share(88) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(93) {
-        (IDLE_MS, used - share(80))
+    } else if used < share(95) {
+        (IDLE_MS, used - share(85))
     } else {
-        (SHORT_MS, used - share(84))
+        (SHORT_MS, used - share(85))
     }
 }
 
