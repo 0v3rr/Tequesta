@@ -204,7 +204,7 @@ pub extern "system" fn CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
-    hook(hwnd);
+    hook(hwnd, parent.is_null());
     hwnd
 }
 
@@ -230,7 +230,7 @@ pub extern "system" fn CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
-    hook(hwnd);
+    hook(hwnd, parent.is_null());
     hwnd
 }
 
@@ -314,7 +314,7 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
 }
 
 /// Puts our procedure in front of the title's and registers F1 menu + Raw Input mouse.
-fn hook(hwnd: HWND) {
+fn hook(hwnd: HWND, top_level: bool) {
     if hwnd.is_null() {
         return;
     }
@@ -322,15 +322,18 @@ fn hook(hwnd: HWND) {
     UI_ACTIONS.call_once(|| {
         victory_gpu::tequesta_ui::register_actions(restart_from_menu, quit_from_menu);
     });
-    let rid = RawInputDevice {
-        us_usage_page: 0x01,
-        us_usage: 0x02,
-        dw_flags: 0,
-        hwnd_target: hwnd,
-    };
-    // SAFETY: registers standard HID mouse raw input for this window.
-    unsafe {
-        let _ = RegisterRawInputDevices(&rid, 1, size_of::<RawInputDevice>() as u32);
+    if top_level {
+        let rid = RawInputDevice {
+            us_usage_page: 0x01,
+            us_usage: 0x02,
+            dw_flags: 0,
+            hwnd_target: hwnd,
+        };
+        // SAFETY: registers standard HID mouse raw input for this top-level window.
+        let ok = unsafe { RegisterRawInputDevices(&rid, 1, size_of::<RawInputDevice>() as u32) };
+        if ok == 0 {
+            tracing::warn!("RegisterRawInputDevices failed for mouse raw input");
+        }
     }
     // SAFETY: a window this thread just created. The title's procedure is
     // stored before ours can run.

@@ -12,13 +12,13 @@ Tested on **Microsoft Windows 11 Famille (x64)** — **AMD EPYC 7543P 32-Core Pr
 | :--- | :--- | :--- |
 | **Executable Load & Boot** | Working | Native x86-64 PE/XEX mapping with TLS redirection and GDK/Scarlett HLE |
 | **Main Menu** | Working | Full 2D/UI rendering at **30 FPS** |
-| **In-Game 3D World** | Working | Boots into Lucia's opening prologue (café cutscene & prison cell) |
-| **Playable & Controls** | Working | Full character movement in the prison and subsequent scenes with working HUD, pause menu, and keyboard/mouse input (`VICTORY_KBM_GTA=1` / `VICTORY_KBM_NATIVE=1`) |
-| **In-Game Frame Rate** | **6–12 FPS** | Measured in active 3D scenes with `VICTORY_PORT_STATIC=1` on RTX A4500 |
+| **In-Game 3D World** | Working | Boots into Lucia's opening prologue (café cutscene & prison sequence before gaining control of Lucia) |
+| **Playable & Controls** | Working | Full character movement in the prison and subsequent scenes with working HUD, pause menu, AZERTY/QWERTY keyboard support (including AZERTY scancode `0x10` cover `RB` and `E` interaction), and native raw mouse camera look (auto-captured on focus when `F1` is closed, `F2`/`~` toggle, `Esc`/`F1` unlock, with cursor clipping and cursor-delta fallback) |
+| **In-Game Frame Rate** | **5–27 FPS** | Measured in active 3D scenes with `VICTORY_PORT_STATIC=1` on RTX A4500 |
 | **3D Lighting & Shaders** | Partial | Deferred lighting, shadows, and environment geometry render; initial scene streaming warms up during the opening cutscene |
 | **Known Issues** | Active | Facial morph targets (`Dispatch` blendshapes) remain static during cutscenes; minor BC7/SSS skin detiling artifacts on character faces/forearms |
 
-> **Video Proof:** [GTA VI In-Game on NVIDIA RTX A4500 (6–12 FPS)](https://www.youtube.com/watch?v=V8ioeQRAytM)
+> **Video Proof:** [GTA VI In-Game on NVIDIA RTX A4500 (earlier 6–12 FPS capture)](https://www.youtube.com/watch?v=V8ioeQRAytM)
 
 ## Architecture Overview
 
@@ -35,7 +35,7 @@ Unlike traditional CPU emulators, x86-64 game instructions execute natively on t
 - **Slab/Bitset Descriptor Caching**: Eliminates per-frame `CopyDescriptorsSimple` bottlenecks across high-draw-count frames (`3,000–5,500+` draws/frame).
 - **Pareto Memory Residency & Batched Card Rehashes**: Prevents WDDM/PCIe paging stalls and accelerates GPU memory tracking (`VICTORY_CARD_REHASH_RUNS=1`).
 - **Low-Overhead Synchronization**: Uses native Windows `WaitOnAddress` / `WakeByAddressAll` for blocking fence waits instead of busy-spin fallbacks.
-- **Native D3D12 Overlay (`F1`) & Config Persistence**: Built-in `F1` menu (`tequesta_ui.rs`) persisted in `tequesta_config.toml` with live `VICTORY_PORT_STATIC`, FPS cap, mouse sensitivity, FPS/ms counter, plus resolution scaling (`50%` / `75%` / `100%`) and borderless fullscreen.
+- **Native D3D12 Overlay (`F1`) & Config Persistence**: Built-in `F1` menu (`tequesta_ui.rs`) persisted in `tequesta_config.toml` with live `VICTORY_PORT_STATIC`, FPS cap, mouse sensitivity, FPS/ms counter, plus resolution scaling (`50%` / `75%` / `100%`) and borderless window mode.
 
 ## Build & Run
 
@@ -51,7 +51,7 @@ Tequesta translates native Windows `WM_INPUT` raw mouse movement and layout-inde
 | Action | Keyboard / Mouse Input | Xbox Series Equivalent |
 | :--- | :--- | :--- |
 | **Open / Close Overlay Menu** | `F1` | Releases mouse cursor & opens `tequesta_ui` |
-| **Toggle Mouse Camera Capture** | `F2` or `~` | Enables/releases raw `WM_INPUT` camera look |
+| **Toggle Mouse Camera Capture** | `F2` or `~` (`²` on AZERTY, scancode `0x29`) | Auto-captures on window focus when `F1` is closed; `F2`/`~` toggles, `Esc`/`P`/`F1` releases |
 | **Move** | `W` `A` `S` `D` (QWERTY) / `Z` `Q` `S` `D` (AZERTY) | Left Stick |
 | **Camera Look** | Mouse Movement | Right Stick |
 | **Fire / Attack / Accelerate** | Left Mouse Click | `RT` |
@@ -62,11 +62,12 @@ Tequesta translates native Windows `WM_INPUT` raw mouse movement and layout-inde
 | **Reload / Melee** | `R` | `B` |
 | **Enter / Exit Vehicle** | `F` | `Y` |
 | **Interact / Talk** | `E` | `D-Pad Right` |
-| **Interact** | `E` | D-Pad Right |
-| **Cover / Handbrake** | `Q` (QWERTY) / `A` (AZERTY) | `RB` |
+| **Cover / Handbrake** | `Q` (QWERTY) / `A` (AZERTY, scancode `0x10`) | `RB` |
 | **Weapon Wheel** | `Tab` | `LB` |
 | **Crouch / Stealth** | `Ctrl` | `L3` |
 | **Pause Menu** | `Esc` or `P` | Menu (also frees mouse cursor) |
+
+> **Gameplay & Mouse Look Note:** During the opening prologue, the game plays through an introductory cutscene and prison sequence before handing over full control of Lucia. Once focused with the `F1` overlay closed, raw mouse camera look (`WM_INPUT`, with cursor-delta fallback) engages automatically and clips the cursor to the client area; press `F2` or `~` to toggle capture, or `F1` / `Esc` / `P` to release the cursor.
 
 ## Configuration & Environment Variables
 
@@ -80,7 +81,7 @@ Pressing `F1` opens the native D3D12 settings overlay (`tequesta_ui.rs`). Change
   * `FPS / Frame-Time HUD`: Compact top-right performance overlay (`ON` / `OFF`)
 * **Restart-Applied Settings (saved via *Apply & Restart*):**
   * `Resolution Scale`: `50%` / `75%` / `100%`
-  * `Display Mode`: `Windowed` / `Borderless Fullscreen`
+  * `Display Mode`: `Windowed` / `Borderless` (borderless window mode)
   * `VICTORY_RAW_VIEWS`: Toggle raw committed resources vs `ExactArenaPool` (`OFF` / `ON`)
   * `Native Keyboard / Mouse`: Toggle `VICTORY_KBM_NATIVE` (`ON` / `OFF`)
 

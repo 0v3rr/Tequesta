@@ -125,17 +125,23 @@ static RAW_MOUSE_DX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32
 #[cfg(windows)]
 static RAW_MOUSE_DY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 #[cfg(windows)]
-static RAW_MOUSE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RAW_MOUSE_LAST_US: AtomicU64 = AtomicU64::new(0);
 
 /// Accumulates relative mouse deltas from `WM_INPUT` (Raw Input) while mouse-look
 /// is locked and the `F1` overlay menu is closed.
 #[cfg(windows)]
 pub(crate) fn push_raw_mouse_delta(dx: i32, dy: i32) {
-    RAW_MOUSE_ACTIVE.store(true, Ordering::Relaxed);
+    RAW_MOUSE_LAST_US.store(now(), Ordering::Relaxed);
     if CURSOR_LOCKED.load(Ordering::Relaxed) && !victory_gpu::tequesta_ui::menu_open() {
         RAW_MOUSE_DX.fetch_add(dx, Ordering::Relaxed);
         RAW_MOUSE_DY.fetch_add(dy, Ordering::Relaxed);
     }
+}
+
+#[cfg(windows)]
+fn raw_mouse_recent(now_us: u64) -> bool {
+    let last = RAW_MOUSE_LAST_US.load(Ordering::Relaxed);
+    last != 0 && now_us.saturating_sub(last) < 250_000
 }
 
 /// Returns true while GTA mouse-look lock (`~` / `F2`) is active and the
@@ -160,11 +166,11 @@ fn native_kbm() -> bool {
         if let Ok(v) = std::env::var("VICTORY_KBM_NATIVE") {
             return parse_env_flag(&v);
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(test)))]
         {
             victory_gpu::tequesta_ui::kbm_native_enabled()
         }
-        #[cfg(not(windows))]
+        #[cfg(any(not(windows), test))]
         {
             false
         }
@@ -176,8 +182,20 @@ fn native_kbm() -> bool {
 /// Off by default in unit tests unless enabled so existing keyboard table tests stay unchanged.
 fn gta_kbm() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("VICTORY_KBM_GTA").is_ok_and(|v| parse_env_flag(&v))
-            || std::env::var("VICTORY_KBM_NATIVE").is_ok_and(|v| parse_env_flag(&v))
+        if let Ok(v) = std::env::var("VICTORY_KBM_GTA") {
+            return parse_env_flag(&v);
+        }
+        if let Ok(v) = std::env::var("VICTORY_KBM_NATIVE") {
+            return parse_env_flag(&v);
+        }
+        #[cfg(all(windows, not(test)))]
+        {
+            victory_gpu::tequesta_ui::kbm_native_enabled()
+        }
+        #[cfg(any(not(windows), test))]
+        {
+            false
+        }
     });
     *ENABLED
 }
@@ -277,6 +295,65 @@ impl MouseButtons {
     }
 }
 
+/// Mouse-look capture state machine: auto-engages when focused and the `F1`
+/// menu is closed, yields on focus loss / `F1` open without permanently pausing,
+/// and respects explicit `F2` / `` ` `` / `~` toggles and `Esc` / `P` unlocks.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct MouseCapture {
+    locked: bool,
+    user_paused: bool,
+    just_locked: bool,
+    toggle_was_down: bool,
+    unlock_was_down: bool,
+}
+
+#[cfg(any(windows, test))]
+impl MouseCapture {
+    fn step(
+        &mut self,
+        active_focus: bool,
+        menu_open: bool,
+        toggle_down: bool,
+        unlock_down: bool,
+    ) -> (bool, bool) {
+        if !active_focus || menu_open {
+            self.locked = false;
+            self.just_locked = false;
+            self.toggle_was_down = toggle_down;
+            self.unlock_was_down = unlock_down;
+            return (false, false);
+        }
+
+        let toggle_edge = toggle_down && !self.toggle_was_down;
+        let unlock_edge = unlock_down && !self.unlock_was_down;
+        self.toggle_was_down = toggle_down;
+        self.unlock_was_down = unlock_down;
+
+        if toggle_edge {
+            if self.locked {
+                self.user_paused = true;
+                self.locked = false;
+                self.just_locked = false;
+            } else {
+                self.user_paused = false;
+                self.locked = true;
+                self.just_locked = true;
+            }
+        } else if unlock_edge && self.locked {
+            self.user_paused = true;
+            self.locked = false;
+            self.just_locked = false;
+        } else if !self.locked && !self.user_paused {
+            self.locked = true;
+            self.just_locked = true;
+        }
+
+        let jl = std::mem::take(&mut self.just_locked);
+        (self.locked, jl)
+    }
+}
+
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -318,11 +395,19 @@ trait Source: Send {
     }
 }
 
+fn is_hw_scancode(sc: u32) -> bool {
+    (1..0x100).contains(&sc)
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     fallback_for(keys, gta_kbm())
 }
 
 fn fallback_for(keys: &[KeyState], gta: bool) -> PadState {
+    fallback_for_mode(keys, gta, native_kbm())
+}
+
+fn fallback_for_mode(keys: &[KeyState], gta: bool, native: bool) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -330,29 +415,48 @@ fn fallback_for(keys: &[KeyState], gta: bool) -> PadState {
             0.0
         }
     };
-    let on_scancode = |sc: u32, vk_fallback: u8| {
+    let on_phys = |sc: u32, vk_fallback: u8| {
         if keys
             .iter()
-            .any(|k| k.scan_code == sc || k.virtual_key == vk_fallback)
+            .any(|k| k.scan_code == sc || (!is_hw_scancode(k.scan_code) && k.virtual_key == vk_fallback))
         {
             1.0
         } else {
             0.0
         }
     };
-    let mut buttons = GTA_BUTTONS
-        .iter()
-        .take(0)
-        .fold(0u32, |a, b| a | b.1);
+    let mut buttons = 0u32;
     let table: &[(u8, u32)] = if gta { &GTA_BUTTONS } else { &FALLBACK_BUTTONS };
-    buttons |= table
-        .iter()
-        .filter(|(vk, _)| on(*vk) != 0.0)
-        .fold(0, |all, (_, bit)| all | bit);
-    if gta && native_kbm() {
+    for &(vk, bit) in table {
+        let pressed = if gta && native && vk == b'Z' {
+            // On AZERTY, physical scancode 0x11 is `Z` (forward), whereas
+            // physical scancode 0x2C is bottom-left (`W` on AZERTY / `Z` on QWERTY).
+            keys.iter()
+                .any(|k| k.scan_code == 0x2C || (k.virtual_key == b'Z' && k.scan_code != 0x11))
+        } else {
+            on(vk) != 0.0
+        };
+        if pressed {
+            buttons |= bit;
+        }
+    }
+    if gta {
+        // Cover/handbrake (RB): scancode 0x10 (Q on QWERTY, A on AZERTY).
+        let cover_down = if native {
+            keys.iter()
+                .any(|k| k.scan_code == 0x10 || (!is_hw_scancode(k.scan_code) && k.virtual_key == b'Q'))
+        } else {
+            keys.iter()
+                .any(|k| k.scan_code == 0x10 || k.virtual_key == b'Q')
+        };
+        if cover_down {
+            buttons |= RIGHT_SHOULDER;
+        }
+    }
+    if gta && native {
         // Layout-independent AZERTY (ZQSD) + QWERTY (WASD) scancode movement.
-        let left_y = on_scancode(0x11, b'W') - on_scancode(0x1F, b'S');
-        let left_x = on_scancode(0x20, b'D') - on_scancode(0x1E, b'A');
+        let left_y = on_phys(0x11, b'W') - on_phys(0x1F, b'S');
+        let left_x = on_phys(0x20, b'D') - on_phys(0x1E, b'A');
         return PadState {
             buttons,
             left_trigger: 0.0,
@@ -1363,10 +1467,10 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{HWND, POINT};
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MAPVK_VSC_TO_VK, MapVirtualKeyW,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1377,8 +1481,8 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, GetForegroundWindow, GetWindowInfo, GetWindowThreadProcessId, HTCLIENT,
-        PostMessageW, SetCursorPos, WINDOWINFO, WM_MOUSEMOVE, WM_SETCURSOR,
+        ClipCursor, GetCursorPos, GetForegroundWindow, GetWindowInfo, GetWindowThreadProcessId,
+        HTCLIENT, PostMessageW, SetCursorPos, WINDOWINFO, WM_MOUSEMOVE, WM_SETCURSOR,
     };
 
     use super::*;
@@ -1423,9 +1527,9 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
-        mouse_locked: bool,
-        just_locked: bool,
-        toggle_was_down: bool,
+        capture: MouseCapture,
+        cursor_clipped: bool,
+        clipped_rect: Option<(i32, i32, i32, i32)>,
         anchor: (i32, i32),
         mouse_last_poll: Option<Instant>,
         mouse_look: MouseLook,
@@ -1433,12 +1537,44 @@ mod host {
     }
 
     impl Host {
+        fn set_cursor_clip(&mut self, rect: Option<(i32, i32, i32, i32)>) {
+            match rect {
+                Some((left, top, right, bottom)) => {
+                    if !self.cursor_clipped || self.clipped_rect != Some((left, top, right, bottom)) {
+                        let rc = RECT {
+                            left,
+                            top,
+                            right,
+                            bottom,
+                        };
+                        // SAFETY: confines cursor to our own foreground client rect while locked.
+                        if unsafe { ClipCursor(&rc) } != 0 {
+                            self.cursor_clipped = true;
+                            self.clipped_rect = Some((left, top, right, bottom));
+                        }
+                    }
+                }
+                None => {
+                    if self.cursor_clipped {
+                        // SAFETY: releases cursor confinement.
+                        unsafe {
+                            let _ = ClipCursor(std::ptr::null());
+                        }
+                        self.cursor_clipped = false;
+                        self.clipped_rect = None;
+                    }
+                }
+            }
+        }
+
         fn set_mouse_locked(&mut self, locked: bool, hwnd: Option<HWND>) {
-            if self.mouse_locked == locked {
+            if !locked {
+                self.set_cursor_clip(None);
+            }
+            if CURSOR_LOCKED.swap(locked, Ordering::Release) == locked {
                 return;
             }
-            self.mouse_locked = locked;
-            CURSOR_LOCKED.store(locked, Ordering::Release);
+            tracing::info!(locked, "mouse look lock state changed");
             if let Some(hwnd) = hwnd {
                 // Prompt the window's UI thread to run WM_SETCURSOR right away
                 // so the cursor hides/reappears the instant `~`/`F2`/`Esc`/`P`
@@ -1452,14 +1588,12 @@ mod host {
         }
 
         fn disarm_mouse(&mut self, hwnd: Option<HWND>, reason: &'static str) {
-            if self.mouse_locked {
-                self.set_mouse_locked(false, hwnd);
+            if CURSOR_LOCKED.load(Ordering::Relaxed) {
                 tracing::info!(reason, "mouse look unlocked");
             }
-            self.just_locked = false;
+            self.set_mouse_locked(false, hwnd);
             self.mouse_look.reset();
             self.mouse_last_poll = None;
-            self.toggle_was_down = false;
             self.mouse_buttons.reset();
         }
     }
@@ -1541,42 +1675,33 @@ mod host {
         }
 
         fn mouse_pad(&mut self, active: bool) -> PadState {
-            if !gta_kbm() || !active || victory_gpu::tequesta_ui::menu_open() {
-                self.disarm_mouse(foreground_window(), "menu or stand-in inactive");
-                RAW_MOUSE_DX.store(0, Ordering::Relaxed);
-                RAW_MOUSE_DY.store(0, Ordering::Relaxed);
-                return PadState::default();
-            }
-            let Some(hwnd) = foreground_window() else {
-                self.disarm_mouse(None, "focus lost");
-                return PadState::default();
-            };
-
             let key_down = |vk: i32| {
                 // SAFETY: plain async key state query.
                 unsafe { GetAsyncKeyState(vk) < 0 }
             };
+            // Toggle mouse-look lock with F2 (0x71), VK_OEM_3 (0xC0, `` ` `` / `~` on US),
+            // or scancode 0x29 (top-left `²` on French AZERTY).
+            // SAFETY: plain keyboard layout query.
+            let top_left_vk = unsafe { MapVirtualKeyW(0x29, MAPVK_VSC_TO_VK) } as i32;
+            let toggle_down =
+                key_down(0x71) || key_down(0xC0) || (top_left_vk != 0 && key_down(top_left_vk));
+            let unlock_down = key_down(0x1B) || key_down(i32::from(b'P'));
 
-            // Toggle mouse-look lock with F2 (0x71, layout-independent) or
-            // VK_OEM_3 (0xC0, `` ` `` / `~` on US layouts).
-            let toggle_down = key_down(0x71) || key_down(0xC0);
-            if toggle_down && !self.toggle_was_down {
-                let next = !self.mouse_locked;
-                self.set_mouse_locked(next, Some(hwnd));
-                self.just_locked = next;
-                self.mouse_look.reset();
-                tracing::info!(locked = next, "mouse look toggled");
-            }
-            self.toggle_was_down = toggle_down;
+            let menu_open = victory_gpu::tequesta_ui::menu_open();
+            let hwnd = foreground_window();
+            let active_focus = gta_kbm() && active && hwnd.is_some();
+            let (locked, just_locked) =
+                self.capture
+                    .step(active_focus, menu_open, toggle_down, unlock_down);
+            self.set_mouse_locked(locked, hwnd);
 
-            // Esc (0x1B) or P opens the pause menu and frees the mouse so the
-            // user is never trapped in mouse-look mode.
-            if self.mouse_locked && (key_down(0x1B) || key_down(i32::from(b'P'))) {
-                self.set_mouse_locked(false, Some(hwnd));
-                self.just_locked = false;
-                self.mouse_look.reset();
-                tracing::info!("mouse look unlocked (menu key)");
+            if !active_focus || menu_open {
+                self.disarm_mouse(hwnd, "menu, focus lost, or stand-in inactive");
+                RAW_MOUSE_DX.store(0, Ordering::Relaxed);
+                RAW_MOUSE_DY.store(0, Ordering::Relaxed);
+                return PadState::default();
             }
+            let hwnd = hwnd.expect("checked active_focus");
 
             let Some((c_left, c_top, c_right, c_bottom)) = client_rect_screen(hwnd) else {
                 self.disarm_mouse(Some(hwnd), "client unavailable");
@@ -1589,60 +1714,53 @@ mod host {
                 return PadState::default();
             }
 
-            let now = Instant::now();
+            let now_inst = Instant::now();
             let dt = self
                 .mouse_last_poll
-                .replace(now)
-                .map_or(POLL, |prev| now.saturating_duration_since(prev));
+                .replace(now_inst)
+                .map_or(POLL, |prev| now_inst.saturating_duration_since(prev));
 
-            let (right_x, right_y) = if self.mouse_locked {
+            let (right_x, right_y) = if locked {
+                self.set_cursor_clip(Some((c_left, c_top, c_right, c_bottom)));
                 let cx = c_left + (c_right - c_left) / 2;
                 let cy = c_top + (c_bottom - c_top) / 2;
                 let (rdx, rdy) = (
                     RAW_MOUSE_DX.swap(0, Ordering::Relaxed),
                     RAW_MOUSE_DY.swap(0, Ordering::Relaxed),
                 );
-                let use_raw = native_kbm() && RAW_MOUSE_ACTIVE.load(Ordering::Relaxed);
-                let (dx, dy) = if self.just_locked {
-                    self.just_locked = false;
-                    if let Some(anchor) = recenter_cursor(cx, cy) {
-                        self.anchor = anchor;
-                    } else if !use_raw {
-                        self.set_mouse_locked(false, Some(hwnd));
-                        self.mouse_look.reset();
-                        tracing::warn!("mouse look unlocked (cursor warp failed)");
-                    }
+                let use_raw = native_kbm() && (rdx != 0 || rdy != 0 || raw_mouse_recent(now()));
+                let (dx, dy) = if just_locked {
+                    self.anchor = recenter_cursor(cx, cy).unwrap_or((pos.x, pos.y));
+                    self.mouse_look.reset();
                     (0, 0)
                 } else if use_raw {
                     // Keep cursor inside client area without FPS-coupled jitter.
-                    if pos.x <= c_left + 32 || pos.x >= c_right - 32 || pos.y <= c_top + 32 || pos.y >= c_bottom - 32 {
-                        let _ = recenter_cursor(cx, cy);
+                    if pos.x <= c_left + 32
+                        || pos.x >= c_right - 32
+                        || pos.y <= c_top + 32
+                        || pos.y >= c_bottom - 32
+                    {
+                        self.anchor = recenter_cursor(cx, cy).unwrap_or((pos.x, pos.y));
+                    } else {
+                        self.anchor = (pos.x, pos.y);
                     }
                     (rdx, rdy)
                 } else {
                     let dx = pos.x - self.anchor.0;
                     let dy = pos.y - self.anchor.1;
                     if dx != 0 || dy != 0 {
-                        if let Some(anchor) = recenter_cursor(cx, cy) {
-                            self.anchor = anchor;
-                            (dx, dy)
-                        } else {
-                            self.set_mouse_locked(false, Some(hwnd));
-                            self.mouse_look.reset();
-                            tracing::warn!("mouse look unlocked (cursor warp failed)");
-                            (0, 0)
-                        }
+                        self.anchor = recenter_cursor(cx, cy).unwrap_or((pos.x, pos.y));
+                        (dx, dy)
                     } else {
                         (0, 0)
                     }
                 };
-                if self.mouse_locked {
-                    self.mouse_look
-                        .step(dx, dy, dt, mouse_sens(), mouse_invert_y())
-                } else {
-                    (0.0, 0.0)
-                }
+                self.mouse_look
+                    .step(dx, dy, dt, mouse_sens(), mouse_invert_y())
             } else {
+                self.set_cursor_clip(None);
+                RAW_MOUSE_DX.store(0, Ordering::Relaxed);
+                RAW_MOUSE_DY.store(0, Ordering::Relaxed);
                 self.mouse_look.reset();
                 (0.0, 0.0)
             };
@@ -1651,7 +1769,7 @@ mod host {
                 (c_left..c_right).contains(&pos.x) && (c_top..c_bottom).contains(&pos.y);
             let [lmb, rmb, mmb] = self.mouse_buttons.update(
                 [key_down(0x01), key_down(0x02), key_down(0x04)],
-                self.mouse_locked || in_client,
+                locked || in_client,
             );
             let mut pad = PadState {
                 right_x,
@@ -2325,5 +2443,65 @@ mod tests {
         host.lock().unwrap().pads[0] = None;
         hub.poll();
         assert_eq!(host.lock().unwrap().mouse_active_log.last(), Some(&true));
+    }
+
+    #[test]
+    fn azerty_scancodes_map_zqsd_and_cover_without_conflicts() {
+        let sc_key = |scan_code: u32, virtual_key: u8| KeyState {
+            scan_code,
+            virtual_key,
+            ..Default::default()
+        };
+        // AZERTY physical 'A' (scancode 0x10) maps strictly to Cover (RB), not strafe-left.
+        let cover = fallback_for_mode(&[sc_key(0x10, b'A')], true, true);
+        assert_eq!(cover.buttons, RIGHT_SHOULDER);
+        assert_eq!(cover.left_x, 0.0);
+
+        // AZERTY physical 'Q' (scancode 0x1E) maps strictly to strafe-left, not Cover.
+        let left = fallback_for_mode(&[sc_key(0x1E, b'Q')], true, true);
+        assert_eq!(left.buttons, 0);
+        assert_eq!(left.left_x, -1.0);
+
+        // AZERTY physical 'Z' (scancode 0x11) maps strictly to forward, not D-pad Down.
+        let fwd = fallback_for_mode(&[sc_key(0x11, b'Z')], true, true);
+        assert_eq!(fwd.buttons, 0);
+        assert_eq!(fwd.left_y, 1.0);
+
+        // AZERTY physical 'W' (scancode 0x2C) maps to D-pad Down, not forward.
+        let down = fallback_for_mode(&[sc_key(0x2C, b'W')], true, true);
+        assert_eq!(down.buttons, DOWN);
+        assert_eq!(down.left_y, 0.0);
+
+        // AZERTY physical 'S' (0x1F) and 'D' (0x20).
+        let back_right = fallback_for_mode(&[sc_key(0x1F, b'S'), sc_key(0x20, b'D')], true, true);
+        assert_eq!((back_right.left_x, back_right.left_y), (1.0, -1.0));
+    }
+
+    #[test]
+    fn mouse_capture_auto_locks_when_focused_and_respects_f1_f2_esc() {
+        let mut cap = MouseCapture::default();
+
+        // Auto-locks on first focused poll while F1 menu is closed.
+        assert_eq!(cap.step(true, false, false, false), (true, true));
+        assert_eq!(cap.step(true, false, false, false), (true, false));
+
+        // Opening F1 menu unlocks, and closing it with Esc held auto-resumes without latching pause.
+        assert_eq!(cap.step(true, true, false, true), (false, false));
+        assert_eq!(cap.step(true, false, false, true), (true, true));
+        assert_eq!(cap.step(true, false, false, false), (true, false));
+
+        // Explicit F2 / `~` toggle pauses mouse look until toggled back on.
+        assert_eq!(cap.step(true, false, true, false), (false, false));
+        assert_eq!(cap.step(true, false, false, false), (false, false));
+        assert_eq!(cap.step(true, false, true, false), (true, true));
+
+        // Esc / P while locked unlocks and stays paused until F2 / `~` is pressed.
+        assert_eq!(cap.step(true, false, false, true), (false, false));
+        assert_eq!(cap.step(true, false, false, false), (false, false));
+        assert_eq!(cap.step(true, false, true, false), (true, true));
+
+        // Focus loss unlocks temporarily and auto-resumes on refocus.
+        assert_eq!(cap.step(false, false, false, false), (false, false));
+        assert_eq!(cap.step(true, false, false, false), (true, true));
     }
 }

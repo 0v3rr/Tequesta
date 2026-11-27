@@ -2,12 +2,12 @@
 //!
 //! - Toggle menu with `F1` (`VK_F1`).
 //! - Hot settings (apply immediately): `VICTORY_PORT_STATIC`, FPS cap
-//!   (`Illimite` / `30` / `60`), mouse sensitivity (`0.25x..3.00x`), and
+//!   (`Unlimited` / `30` / `60`), mouse sensitivity (`0.25x..3.00x`), and
 //!   compact FPS/ms corner counter.
 //! - Restart-required settings (persisted to `tequesta_config.toml`):
 //!   resolution scale (`50%` / `75%` / `100%`), windowed vs borderless
 //!   fullscreen, `VICTORY_RAW_VIEWS`, and `VICTORY_KBM_NATIVE`.
-//! - Action buttons: `APPLIQUER & REDEMARRER` and `QUITTER LE JEU`.
+//! - Action buttons: `APPLY & RESTART` and `QUIT GAME`.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
@@ -461,51 +461,51 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     c.border(0, 0, MENU_W, MENU_H, BORDER);
     c.rect(1, 1, MENU_W - 2, 42, HEADER_BG);
     c.text(16, 14, 2, ACCENT, "TEQUESTA MENU F1");
-    let tag = if pending_restart { "REDEMARRAGE REQUIS" } else { "PRET" };
+    let tag = if pending_restart { "RESTART REQUIRED" } else { "READY" };
     let tag_col = if pending_restart { ORANGE } else { GREEN };
     c.text(MENU_W - 14 - (tag.len() as u32 * 12), 16, 2, tag_col, tag);
 
-    c.text(16, 54, 2, ACCENT, "PARAMETRES A CHAUD");
+    c.text(16, 54, 2, ACCENT, "LIVE SETTINGS");
     draw_menu_row(&mut c, selected, 0, "VICTORY_PORT_STATIC", if cfg.port_static { "ON" } else { "OFF" }, if cfg.port_static { GREEN } else { RED });
     let fps_str = match cfg.fps_cap {
         30 => "30 FPS",
         60 => "60 FPS",
-        _ => "ILLIMITE",
+        _ => "UNLIMITED",
     };
-    draw_menu_row(&mut c, selected, 1, "PLAFOND FPS", fps_str, ACCENT);
+    draw_menu_row(&mut c, selected, 1, "FPS CAP", fps_str, ACCENT);
     let sens_str = format!("{:.2}X", cfg.mouse_sensitivity);
-    draw_menu_row(&mut c, selected, 2, "SENSIBILITE SOURIS", &sens_str, WHITE);
-    draw_menu_row(&mut c, selected, 3, "COMPTEUR FPS/MS", if cfg.show_fps_hud { "ON" } else { "OFF" }, if cfg.show_fps_hud { GREEN } else { MUTED });
+    draw_menu_row(&mut c, selected, 2, "MOUSE SENSITIVITY", &sens_str, WHITE);
+    draw_menu_row(&mut c, selected, 3, "FPS/MS COUNTER", if cfg.show_fps_hud { "ON" } else { "OFF" }, if cfg.show_fps_hud { GREEN } else { MUTED });
 
     c.rect(14, 194, MENU_W - 28, 1, BORDER);
-    c.text(16, 200, 2, ORANGE, "REDEMARRAGE REQUIS");
+    c.text(16, 200, 2, ORANGE, "RESTART REQUIRED");
 
     let res_str = format!("{}%", cfg.resolution_scale);
-    draw_menu_row(&mut c, selected, 4, "ECHELLE RESOLUTION", &res_str, WHITE);
+    draw_menu_row(&mut c, selected, 4, "RESOLUTION SCALE", &res_str, WHITE);
     draw_menu_row(
         &mut c,
         selected,
         5,
-        "AFFICHAGE",
-        if cfg.borderless_fullscreen { "PLEIN ECRAN" } else { "FENETRE" },
+        "DISPLAY MODE",
+        if cfg.borderless_fullscreen { "BORDERLESS" } else { "WINDOWED" },
         WHITE,
     );
     draw_menu_row(&mut c, selected, 6, "VICTORY_RAW_VIEWS", if cfg.raw_views { "ON" } else { "OFF" }, if cfg.raw_views { GREEN } else { MUTED });
-    draw_menu_row(&mut c, selected, 7, "CLAVIER/SOURIS NATIF", if cfg.kbm_native { "ON" } else { "OFF" }, if cfg.kbm_native { GREEN } else { RED });
+    draw_menu_row(&mut c, selected, 7, "NATIVE KEYBOARD/MOUSE", if cfg.kbm_native { "ON" } else { "OFF" }, if cfg.kbm_native { GREEN } else { RED });
 
     // Bottom action buttons.
     let y_btn = row_y(8);
     let (bx1, bw1) = (18u32, 286u32);
     c.rect(bx1, y_btn, bw1, 32, if selected == 8 { BTN_RESTART_HL } else { BTN_RESTART });
     c.border(bx1, y_btn, bw1, 32, BORDER);
-    c.text(bx1 + 14, y_btn + 9, 2, WHITE, "APPLIQUER & REDEMARRER");
+    c.text(bx1 + 53, y_btn + 9, 2, WHITE, "APPLY & RESTART");
 
     let (bx2, bw2) = (318u32, 184u32);
     c.rect(bx2, y_btn, bw2, 32, if selected == 9 { BTN_QUIT_HL } else { BTN_QUIT });
     c.border(bx2, y_btn, bw2, 32, BORDER);
-    c.text(bx2 + 12, y_btn + 9, 2, WHITE, "QUITTER LE JEU");
+    c.text(bx2 + 38, y_btn + 9, 2, WHITE, "QUIT GAME");
 
-    c.text(16, MENU_H - 22, 1, MUTED, "F1:FERMER  HAUT/BAS:CHOIX  GAUCHE/DROITE/ENTREE:MODIFIER");
+    c.text(16, MENU_H - 22, 1, MUTED, "F1:CLOSE  UP/DOWN:SELECT  LEFT/RIGHT/ENTER:CHANGE");
     c
 }
 
@@ -799,11 +799,15 @@ mod tests {
 
     #[test]
     fn menu_and_hud_paint_cleanly() {
-        let cfg = TequestaConfig::default();
+        let mut cfg = TequestaConfig::default();
         let menu = paint_menu(&cfg, 0, false);
         assert_eq!(menu.rgb.len(), (MENU_W * MENU_H) as usize);
         let pitch = (MENU_W as usize * 4).next_multiple_of(256);
         assert_eq!(menu.pack(DXGI_FORMAT_R8G8B8A8_UNORM, pitch).len(), pitch * MENU_H as usize);
+
+        cfg.borderless_fullscreen = true;
+        let menu_restart = paint_menu(&cfg, 8, true);
+        assert_eq!(menu_restart.rgb.len(), (MENU_W * MENU_H) as usize);
 
         let hud = paint_hud(24.5, 40.8);
         assert_eq!(hud.rgb.len(), (HUD_W * HUD_H) as usize);
