@@ -8,7 +8,7 @@
 
 ## Current Status & Benchmarks (GTA VI)
 
-Tested on **Windows 10/11 (x64)** with an **NVIDIA RTX A4500 (20 GB VRAM)**:
+Tested on **Microsoft Windows 11 Famille (x64)** — **AMD EPYC 7543P 32-Core Processor**, **28 GB RAM**, **NVIDIA RTX A4500 (20 GB VRAM, Driver 32.0.15.9686)**:
 
 | Milestone | Status | Verified Notes |
 | :--- | :--- | :--- |
@@ -71,6 +71,7 @@ $env:VICTORY_KBM_GTA = "1"
 ## Disclaimer
 
 This repository contains **source code only**. No copyrighted game assets, encryption keys, or precompiled executables are hosted, distributed, or linked. Licensed under **GPL-3.0**.
+
 
 
 
