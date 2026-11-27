@@ -12,10 +12,11 @@
 //! 79.5 (2,490 calls joined, 1,619 of them a texture's state change after
 //! its upload followed by the next texture's aliasing).
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::core::Interface;
 
 /// Whether barriers are held now (`VICTORY_JOIN_BARRIERS=1`, on by default
 /// unless `VICTORY_JOIN_BARRIERS=0`, or its phase of `VICTORY_AB`).
@@ -42,13 +43,55 @@ pub(crate) static STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync:
 
 pub(crate) struct Rec {
     list: ID3D12GraphicsCommandList,
+    list7: OnceLock<Option<ID3D12GraphicsCommandList7>>,
     any: AtomicBool,
     held: Mutex<Held>,
 }
 
 impl Rec {
     pub(crate) fn new(list: ID3D12GraphicsCommandList) -> Self {
-        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())) }
+        Self {
+            list,
+            list7: OnceLock::new(),
+            any: AtomicBool::new(false),
+            held: Mutex::new(Held(Vec::new())),
+        }
+    }
+
+    /// Emits native D3D12 enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`)
+    /// after flushing any held legacy barriers so ordering is preserved.
+    /// Returns `false` if `ID3D12GraphicsCommandList7` is unavailable.
+    ///
+    /// # Safety
+    /// As `ID3D12GraphicsCommandList7::Barrier`: an open list and live resources.
+    pub(crate) unsafe fn enhanced_barriers(&self, groups: &[D3D12_BARRIER_GROUP]) -> bool {
+        if groups.is_empty() {
+            return true;
+        }
+        for g in groups {
+            if g.Type != D3D12_BARRIER_TYPE_BUFFER || g.NumBarriers == 0 {
+                return false;
+            }
+            // SAFETY: `Type == D3D12_BARRIER_TYPE_BUFFER`.
+            let ptr = unsafe { g.Anonymous.pBufferBarriers };
+            if ptr.is_null() {
+                return false;
+            }
+            // SAFETY: caller guarantees `NumBarriers` entries at `ptr`.
+            let barriers = unsafe { std::slice::from_raw_parts(ptr, g.NumBarriers as usize) };
+            if !barriers.iter().all(valid_buffer_barrier) {
+                return false;
+            }
+        }
+        if self.any.load(Relaxed) {
+            self.flush();
+        }
+        let Some(l7) = self.list7.get_or_init(|| self.list.cast().ok()).as_ref() else {
+            return false;
+        };
+        // SAFETY: caller guarantees an open list and validated buffer barrier descriptors.
+        unsafe { l7.Barrier(groups) };
+        true
     }
 
     /// Records `barriers` now, or holds them for the next use of the list.
@@ -97,6 +140,46 @@ impl Rec {
         held.0.clear();
         STATS[1].fetch_add(1, Relaxed);
     }
+}
+
+/// Verifies that `b` is a PC-legal `D3D12_BUFFER_BARRIER` on a live
+/// `DEFAULT`-heap UAV-capable host buffer, with valid non-zero sync/access masks.
+fn valid_buffer_barrier(b: &D3D12_BUFFER_BARRIER) -> bool {
+    const VALID_SYNC: u32 = 0x1 | 0x80 | 0x200 | 0x800 | 0x1000;
+    const VALID_ACCESS: u32 = 0x10 | 0x80 | 0x200 | 0x400 | 0x800;
+    const WRITE_ACCESS: u32 = 0x10 | 0x400;
+    if b.Offset != 0 || b.Size != u64::MAX {
+        return false;
+    }
+    let sb = b.SyncBefore.0 as u32;
+    let sa = b.SyncAfter.0 as u32;
+    if sb == 0 || sa == 0 || (sb & !VALID_SYNC) != 0 || (sa & !VALID_SYNC) != 0 {
+        return false;
+    }
+    let ab = b.AccessBefore.0 as u32;
+    let aa = b.AccessAfter.0 as u32;
+    if (ab & !VALID_ACCESS) != 0 || (aa & !VALID_ACCESS) != 0 {
+        return false;
+    }
+    if ((ab & WRITE_ACCESS) != 0 && ab != 0x10 && ab != 0x400)
+        || ((aa & WRITE_ACCESS) != 0 && aa != 0x10 && aa != 0x400)
+    {
+        return false;
+    }
+    let Some(res) = b.pResource.as_ref() else {
+        return false;
+    };
+    // SAFETY: `res` is a live `ID3D12Resource` borrowed from the caller.
+    let desc = unsafe { res.GetDesc() };
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        || (desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0
+    {
+        return false;
+    }
+    let mut heap = D3D12_HEAP_PROPERTIES::default();
+    // SAFETY: querying heap properties of a live resource.
+    unsafe { res.GetHeapProperties(Some(&mut heap), None) }.is_ok()
+        && heap.Type == D3D12_HEAP_TYPE_DEFAULT
 }
 
 /// The resource a state change or aliasing names (its interface pointer).

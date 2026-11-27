@@ -11,6 +11,7 @@
 #[cfg(windows)]
 pub mod apu;
 pub mod audio;
+pub mod bvh_builder;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
@@ -77,6 +78,9 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     if fidelityfx::serving() {
         all.push(fidelityfx::module());
+    }
+    if bvh_builder::serving() {
+        all.push(bvh_builder::module());
     }
     all
 }

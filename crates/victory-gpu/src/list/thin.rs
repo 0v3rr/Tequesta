@@ -502,6 +502,10 @@ plain! {
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
 }
 
+pub(super) fn write_u64(this: This, address: u64, value: u64) {
+    write64(this, address, value, 0, 0);
+}
+
 const fn after(n: u64) -> u64 {
     Plain::END as u64 + n
 }
@@ -600,8 +604,60 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    if count == 0 {
+        return;
+    }
+    if groups.is_null() || count > 256 {
+        front(this).put(BARRIER_GROUPS, &[u64::from(count), 0]);
+        return;
+    }
+    let mut header_bytes = vec![0u8; count as usize * 16];
+    if !crate::host::read_into(groups, &mut header_bytes) {
+        front(this).put(BARRIER_GROUPS, &[u64::from(count), 0]);
+        return;
+    }
+    let mut payload = Vec::new();
+    let mut packed_groups = 0u32;
+    for chunk in header_bytes.chunks_exact(16) {
+        let kind = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        let num = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+        let ptr = u64::from_le_bytes(chunk[8..16].try_into().unwrap()) as *const u8;
+        let elem_sz = match kind {
+            0 => 16usize,
+            1 => 64usize,
+            2 => 40usize,
+            _ => {
+                front(this).put(BARRIER_GROUPS, &[u64::from(count), 0]);
+                return;
+            }
+        };
+        if num == 0 {
+            continue;
+        }
+        if num > 2048 || ptr.is_null() {
+            front(this).put(BARRIER_GROUPS, &[u64::from(count), 0]);
+            return;
+        }
+        let byte_len = num as usize * elem_sz;
+        let start = payload.len();
+        payload.extend_from_slice(&kind.to_le_bytes());
+        payload.extend_from_slice(&num.to_le_bytes());
+        payload.resize(start + 8 + byte_len, 0);
+        if !crate::host::read_into(ptr, &mut payload[start + 8..]) {
+            front(this).put(BARRIER_GROUPS, &[u64::from(count), 0]);
+            return;
+        }
+        packed_groups += 1;
+    }
+    if packed_groups == 0 {
+        return;
+    }
+    front(this).put_with(
+        BARRIER_GROUPS,
+        &[u64::from(packed_groups), payload.len() as u64],
+        &[&payload],
+    );
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -874,7 +930,52 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 BARRIER => {
                     super::barrier(list, n as u32, at_or(w, 1));
                 }
-                BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+                BARRIER_GROUPS => {
+                    let payload_bytes = w.get(1).copied().unwrap_or(0) as usize;
+                    if payload_bytes == 0 || n == 0 {
+                        super::barrier_groups(list, n as u32, std::ptr::null());
+                    } else {
+                        // SAFETY: `w` holds `payload_bytes` bytes starting at `w[2]`.
+                        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(at(w, 2, payload_bytes), payload_bytes) };
+                        let mut groups = Vec::with_capacity(n);
+                        let mut off = 0usize;
+                        let mut ok = true;
+                        for _ in 0..n {
+                            if off + 8 > bytes.len() {
+                                ok = false;
+                                break;
+                            }
+                            let kind = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                            let num = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+                            off += 8;
+                            let elem_sz = match kind {
+                                0 => 16usize,
+                                1 => 64usize,
+                                2 => 40usize,
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            };
+                            let blen = num as usize * elem_sz;
+                            if off + blen > bytes.len() {
+                                ok = false;
+                                break;
+                            }
+                            groups.push(super::GuestBarrierGroup {
+                                kind,
+                                count: num,
+                                barriers: bytes[off..].as_ptr() as u64,
+                            });
+                            off += blen;
+                        }
+                        if ok && !groups.is_empty() {
+                            super::barrier_groups_trusted(list, &groups);
+                        } else {
+                            super::barrier_groups(list, n as u32, std::ptr::null());
+                        }
+                    }
+                }
                 VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
                 SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
                 BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),

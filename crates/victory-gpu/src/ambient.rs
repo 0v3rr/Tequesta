@@ -136,9 +136,10 @@ fn effective_set() -> Set {
     }
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// Whether the stand-in is on: set, or the lightweight reflection/probe guard
+/// is active, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    effective_set() != Set::Off && !crate::pipeline::builder_runs()
+    (effective_set() != Set::Off || probe_guard_on()) && !crate::pipeline::builder_runs()
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -367,7 +368,9 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float far = float(at.z) / float(d);
-    float cap = max(air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far), 0.05);
+    float room_luma = dot(cells[CELLS].rgb, LUMA);
+    float seen_luma = level > 0.0 ? dot(seen_there, LUMA) : room_luma;
+    float cap = max(air * lerp(room_luma, seen_luma, far), 0.05);
     float3 c = scattered[at];
     bool bad = any(isnan(c)) || any(isinf(c)) || any(c < 0.0);
     c = any(isnan(c)) || any(isinf(c)) ? 0.0 : max(c, 0.0);
@@ -400,6 +403,19 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     if (at.x >= width || at.y >= height) return;
     int2 p = int2(at.xy);
+    if (level <= 0.0 && constant <= 0.0) {
+        float3 was = unpack(light[p]);
+        if (any(isnan(was)) || any(isinf(was)) || any(was < 0.0)) was = 0.0;
+        if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+        float room = max(dot(cells[CELLS].rgb, LUMA), 0.05);
+        float top = max(room * most, 0.05);
+        float has = dot(was, LUMA);
+        if (has > top) {
+            was *= top / max(has, 1e-6);
+        }
+        light[p] = pack(was);
+        return;
+    }
     float3 c = seen(p, size);
     float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
     float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
@@ -591,10 +607,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
-    let (level, constant) = match effective_set() {
+    let (level, constant, guard_only) = match effective_set() {
+        Set::Off if probe_guard_on() => (0.0f32, 0.0f32, true),
         Set::Off => return false,
-        Set::Estimate(level) => (level, 0.0f32),
-        Set::Constant(level) => (0.0, level),
+        Set::Estimate(level) => (level, 0.0f32, false),
+        Set::Constant(level) => (0.0, level, false),
     };
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
@@ -613,7 +630,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.cells);
     list.keep(&pass.points);
     list.keep(&pass.stats);
-    let [strength, radius] = shade();
+    let [mut strength, radius] = shade();
+    if guard_only {
+        strength = 0.0;
+    }
     let floats = [level, constant, strength, radius, 0.1, 0.45];
     let mut words = [0u32; 15];
     for (to, v) in words.iter_mut().zip(floats) {
@@ -655,7 +675,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
-                if constant == 0.0 {
+                if !guard_only && constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }

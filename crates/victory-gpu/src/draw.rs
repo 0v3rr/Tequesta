@@ -65,13 +65,19 @@ struct TableGroup {
     has_uav: bool,
     max_dword: u32,
     entries: Vec<UsedResource>,
+    entry_writes: Vec<bool>,
     indexed: Vec<RootIndexedView>,
     // Descriptor number -> first declaration, matching the bind-time search.
     by_descriptor: Vec<(u32, usize)>,
 }
 
 impl TablePlan {
-    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
+    pub(crate) fn new(
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+        used_written: &[bool],
+        write_unknown: bool,
+    ) -> Self {
         let mut slots: Vec<_> = used
             .iter()
             .filter(|u| u.root == RootType::Table)
@@ -87,12 +93,16 @@ impl TablePlan {
                 has_uav: false,
                 max_dword: 0,
                 entries: Vec::new(),
+                entry_writes: Vec::new(),
                 by_descriptor: Vec::new(),
                 indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
             })
             .collect();
         let mut direct = Vec::new();
-        for &u in used.iter().filter(|u| u.root == RootType::Table) {
+        for (idx, &u) in used.iter().enumerate() {
+            if u.root != RootType::Table {
+                continue;
+            }
             let i = slots
                 .binary_search(&u.slot)
                 .expect("table slot collected from these declarations");
@@ -105,6 +115,9 @@ impl TablePlan {
                 .by_descriptor
                 .push((u.table_offset_dwords / 8, group.entries.len()));
             group.entries.push(u);
+            group
+                .entry_writes
+                .push(write_unknown || used_written.get(idx).copied().unwrap_or(true));
         }
         for group in &mut groups {
             group.by_descriptor.sort_unstable();
@@ -115,12 +128,13 @@ impl TablePlan {
 }
 
 impl TableGroup {
-    fn entry(&self, descriptor: u32) -> Option<&UsedResource> {
+    fn entry(&self, descriptor: u32) -> Option<(&UsedResource, bool)> {
         let i = self
             .by_descriptor
             .binary_search_by_key(&descriptor, |item| item.0)
             .ok()?;
-        Some(&self.entries[self.by_descriptor[i].1])
+        let idx = self.by_descriptor[i].1;
+        Some((&self.entries[idx], self.entry_writes[idx]))
     }
 
     fn needs_snapshot(&self, heap: &crate::descriptor::Heap, host_count: u32, table: u64) -> bool {
@@ -181,6 +195,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a table descriptor is bound: whether this binding may be
+    /// written (`written_used` when known, else falls back to `STORES`).
+    static BINDING_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -1436,10 +1453,12 @@ impl State {
             t => t,
         };
         // SAFETY: an open list.
-        unsafe {
-            list.list
-                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
-        };
+        if !list.is_compute() {
+            unsafe {
+                list.list
+                    .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
+            };
+        }
     }
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
@@ -1632,14 +1651,16 @@ impl State {
         }
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
-        unsafe {
-            list.list.OMSetRenderTargets(
-                view_count as u32,
-                (view_count > 0).then_some(rtvs.as_ptr()),
-                false,
-                dsv.as_ref().map(std::ptr::from_ref),
-            )
-        };
+        if !list.is_compute() {
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    view_count as u32,
+                    (view_count > 0).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
+        }
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -2026,6 +2047,9 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if list.is_compute() && !compute {
+            return false;
+        }
         self.sync_host_list(list);
         let l = &list.list;
         let prof = crate::host::perf_trace_on();
@@ -3402,6 +3426,49 @@ impl State {
         });
     }
 
+    fn skip_compute_hash(hash: &str) -> bool {
+        static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let list = SKIP.get_or_init(|| {
+            std::env::var("VICTORY_SKIP_COMPUTE_HASH")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| {
+                    let s = s.trim();
+                    s.strip_prefix("0x")
+                        .or_else(|| s.strip_prefix("0X"))
+                        .unwrap_or(s)
+                        .to_ascii_lowercase()
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+        !list.is_empty() && !hash.is_empty() && list.iter().any(|h| h == hash)
+    }
+
+    fn log_compute_dispatch(hash: &str, x: u32, y: u32, z: u32, indirect: bool) {
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*TRACE.get_or_init(|| {
+            std::env::var_os("VICTORY_TRACE_COMPUTE").is_some_and(|v| v == "1")
+        }) {
+            return;
+        }
+        let frame = crate::frame::current();
+        if frame < 1300 {
+            return;
+        }
+        static SEEN: std::sync::Mutex<std::collections::BTreeMap<(String, bool), u64>> =
+            std::sync::Mutex::new(std::collections::BTreeMap::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= 256 && !seen.contains_key(&(hash.to_owned(), indirect)) {
+            return;
+        }
+        let count = seen.entry((hash.to_owned(), indirect)).or_insert(0);
+        *count += 1;
+        if *count == 1 || count.is_power_of_two() {
+            tracing::info!(frame, hash, x, y, z, indirect, count = *count, "compute dispatch");
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
@@ -3439,6 +3506,16 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        let hash = p.stages.first().map(|s| s.shader.hash.as_str()).unwrap_or("");
+        if !hash.is_empty() && Self::skip_compute_hash(hash) {
+            static SKIPPED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+                std::sync::Mutex::new(std::collections::BTreeSet::new());
+            if SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).insert(hash.to_owned()) {
+                tracing::info!(hash, "skipping compute dispatch via VICTORY_SKIP_COMPUTE_HASH");
+            }
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3463,6 +3540,25 @@ impl State {
             .flatten();
         let threads = [x, y, z];
         let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        if x == 0 || y == 0 || z == 0 {
+            return;
+        }
+        if x > 65_535 || y > 65_535 || z > 65_535 {
+            static ABSURD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = ABSURD.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 16 || n.is_power_of_two() {
+                tracing::warn!(
+                    frame = crate::frame::current(),
+                    hash,
+                    x,
+                    y,
+                    z,
+                    "dropping absurd compute dispatch group count"
+                );
+            }
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if size.is_some() {
             if !crate::pipeline::is_builder(self.pipeline as This) {
                 once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
@@ -3474,6 +3570,7 @@ impl State {
                 self.last_bind[1] = None;
             }
         }
+        Self::log_compute_dispatch(hash, x, y, z, false);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         if p.stages.iter().any(|s| s.translated().stores || !s.root_uavs.is_empty()) {
@@ -3877,6 +3974,9 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        if list.is_compute() {
+            return;
+        }
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -4106,7 +4206,9 @@ impl State {
                         }
                     }
                 }
+                BINDING_WRITES.set(group.entry_writes[e]);
                 self.table_entry(list, &group.entries[e], compute);
+                BINDING_WRITES.set(STORES.get());
             }
         }
         if let Some(t0) = t_dir {
@@ -4217,9 +4319,10 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for (u, &writes) in entries.iter().zip(&group.entry_writes).filter(|(u, _)| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
+                        BINDING_WRITES.set(writes);
                         readable(list, u.kind, &view);
                     }
                 }
@@ -4231,9 +4334,11 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
+                        BINDING_WRITES.set(STORES.get());
                         readable(list, kind, &view);
                     }
                 }
+                BINDING_WRITES.set(STORES.get());
                 let depth = TESTED_DEPTH.get().1;
                 TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
                 if once && let Some(known) = self.fresh_tables.get_mut(&key) {
@@ -4324,9 +4429,9 @@ impl State {
                         DRAW_PROF[10].fetch_add(1, Ordering::Relaxed);
                     }
                     let t_read = prof_tbl.then(std::time::Instant::now);
-                    let kind = group
-                        .entry(k)
-                        .map(|u| u.kind)
+                    let used = group.entry(k);
+                    let kind = used
+                        .map(|(u, _)| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
                     let was = (listed.ready, listed.tabled);
                     if let Some(kind) = kind {
@@ -4341,7 +4446,9 @@ impl State {
                             }
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
                             TESTED_DEPTH.set((tested.0, false));
+                            BINDING_WRITES.set(used.map_or_else(|| STORES.get(), |(_, w)| w));
                             readable(list, kind, &view);
+                            BINDING_WRITES.set(STORES.get());
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv {
@@ -4425,11 +4532,13 @@ impl State {
                             DRAW_PROF[14].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                         }
                         let t_read = prof_tbl.then(std::time::Instant::now);
-                        let kind = used.map(|u| u.kind).or_else(|| {
+                        let kind = used.map(|(u, _)| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
+                            BINDING_WRITES.set(used.map_or_else(|| STORES.get(), |(_, w)| w));
                             readable(list, kind, &view);
+                            BINDING_WRITES.set(STORES.get());
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -4549,6 +4658,9 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        if list.is_compute() {
+            return;
+        }
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -4660,6 +4772,9 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        if list.is_compute() {
+            return;
+        }
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -4885,6 +5000,9 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        if list.is_compute() && kind != DISPATCH {
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -4893,6 +5011,38 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
+        };
+        if max == 0 {
+            return false;
+        }
+        let compute_hash = if kind == DISPATCH {
+            let hash = p.stages.first().map(|s| s.shader.hash.as_str()).unwrap_or("");
+            if !hash.is_empty() && Self::skip_compute_hash(hash) {
+                static SKIPPED_IND: std::sync::Mutex<std::collections::BTreeSet<String>> =
+                    std::sync::Mutex::new(std::collections::BTreeSet::new());
+                if SKIPPED_IND.lock().unwrap_or_else(|e| e.into_inner()).insert(hash.to_owned()) {
+                    tracing::info!(hash, "skipping indirect compute dispatch via VICTORY_SKIP_COMPUTE_HASH");
+                }
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            if max > 65_535 {
+                static ABSURD_IND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = ABSURD_IND.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 16 || n.is_power_of_two() {
+                    tracing::warn!(
+                        frame = crate::frame::current(),
+                        hash,
+                        max,
+                        "dropping absurd indirect compute dispatch max count"
+                    );
+                }
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            Some(hash)
+        } else {
+            None
         };
         // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
@@ -5066,6 +5216,9 @@ impl State {
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
         if kind == MESH {
             self.mesh_scissor(list, true);
+        }
+        if let Some(hash) = compute_hash {
+            Self::log_compute_dispatch(hash, max, 1, 1, true);
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
@@ -5344,7 +5497,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            if (BINDING_WRITES.get() && STORES.get()) || !write_skip() {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
                 shadow.gpu_writes(list, address, len);
@@ -5578,21 +5731,33 @@ const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+    if list.is_compute() {
+        return;
+    }
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+    if list.is_compute() {
+        return;
+    }
     // SAFETY: an open list.
     unsafe { list.list.RSSetScissorRects(rects) };
 }
 
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
+    if list.is_compute() {
+        return;
+    }
     // SAFETY: an open list.
     unsafe { list.list.OMSetBlendFactor(factor) };
 }
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
+    if list.is_compute() {
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
@@ -5600,6 +5765,12 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 }
 
 pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if list.is_compute() || !min.is_finite() || !max.is_finite() {
+        return;
+    }
+    let min = min.clamp(0.0, 1.0);
+    let max = max.clamp(0.0, 1.0);
+    let (min, max) = if min <= max { (min, max) } else { (max, min) };
     #[cfg(feature = "diagnostics")]
     crate::capture::op(std::ptr::from_ref(list) as usize, || {
         format!("DEPTH BOUNDS {min}..{max}")

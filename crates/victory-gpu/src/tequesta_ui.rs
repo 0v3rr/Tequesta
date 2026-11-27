@@ -508,12 +508,12 @@ fn apply_preset(cfg: &mut TequestaConfig, preset: Preset) -> bool {
         Preset::MaxFps => {
             cfg.resolution_scale = 50;
             cfg.ambient_gi = false;
-            cfg.reflection_probe_guard = false;
+            cfg.reflection_probe_guard = true;
         }
         Preset::BalancedRtx => {
             cfg.resolution_scale = 75;
             cfg.ambient_gi = true;
-            cfg.reflection_probe_guard = false;
+            cfg.reflection_probe_guard = true;
         }
         Preset::Quality => {
             cfg.resolution_scale = 100;
@@ -546,8 +546,8 @@ fn active_preset(cfg: &TequestaConfig) -> Option<Preset> {
         return None;
     }
     match (cfg.resolution_scale, cfg.ambient_gi, cfg.reflection_probe_guard) {
-        (50, false, false) => Some(Preset::MaxFps),
-        (75, true, false) => Some(Preset::BalancedRtx),
+        (50, false, true) => Some(Preset::MaxFps),
+        (75, true, true) => Some(Preset::BalancedRtx),
         (100, true, true) => Some(Preset::Quality),
         _ => None,
     }
@@ -1478,12 +1478,14 @@ mod tests {
         assert_eq!(active_preset(&cfg), Some(Preset::MaxFps));
         assert_eq!(cfg.resolution_scale, 50);
         assert!(!cfg.ambient_gi);
+        assert!(cfg.reflection_probe_guard);
         assert!(!cfg.raw_views);
 
         assert!(apply_preset(&mut cfg, Preset::BalancedRtx));
         assert_eq!(active_preset(&cfg), Some(Preset::BalancedRtx));
         assert_eq!(cfg.resolution_scale, 75);
         assert!(cfg.ambient_gi);
+        assert!(cfg.reflection_probe_guard);
 
         assert!(apply_preset(&mut cfg, Preset::Quality));
         assert_eq!(active_preset(&cfg), Some(Preset::Quality));

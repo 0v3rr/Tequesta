@@ -3257,6 +3257,28 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(out)
 }
 
+/// Resolves a placed unordered-access texture view at `address` only if an
+/// existing compatible host-written texture already exists at `address` in
+/// `TARGETS_AT`. Never registers a new uninitialized UAV texture into
+/// `TARGETS_AT` (which would shadow CPU-streamed textures via `alias_of`).
+#[cfg(windows)]
+pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    const ALLOW_UNORDERED_ACCESS: u32 = 0x4;
+    if let Some(&other) = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner()).get(&address) {
+        let other_ptr = other as This;
+        let o = resource(other_ptr);
+        if o.desc.dimension == desc[0]
+            && o.desc.width == (u64::from(desc[4]) | u64::from(desc[5]) << 32)
+            && o.desc.height == desc[6]
+            && family(pc_format(o.desc.format)) == family(pc_format(desc[8]))
+            && ((o.desc.flags & ALLOW_UNORDERED_ACCESS) != 0 || twin(other_ptr).is_some())
+        {
+            return Some(other_ptr);
+        }
+    }
+    None
+}
+
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,

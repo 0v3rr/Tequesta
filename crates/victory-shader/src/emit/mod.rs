@@ -299,6 +299,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
+    out.push(u8::from(lower::intersect::no_hit()));
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out
 }

@@ -5259,16 +5259,21 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let words: Option<[u32; 10]> = desc[..10].try_into().ok();
+    if *unordered {
+        let texture = crate::resource::uav_texture_at(address, resource)?;
+        return Some(View::Unordered(texture as usize, 0, words));
+    }
     let texture = crate::resource::texture_at(address, resource)?;
     crate::resource::want_level(texture, crate::resource::first_mip(desc));
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    Some(View::Shader(texture as usize, words))
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

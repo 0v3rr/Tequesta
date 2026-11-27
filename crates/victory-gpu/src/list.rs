@@ -250,12 +250,15 @@ fn pools() -> bool {
 }
 
 /// A host list open for recording: one that has run, as a title's list is
-/// after its reset, or a new one.
+/// after its reset, or a new one. `kind == 2` requests a `COMPUTE` list when
+/// the host's async compute queue is enabled.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+fn fresh_list(kind: u32) -> Option<crate::host::HostList> {
+    let want_compute = kind == 2 && crate::host::host().is_some_and(|h| h.async_compute_on());
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
+        let pos = idle.0.iter().rposition(|entry| entry.0.is_compute() == want_compute);
+        let taken = pos.map(|i| idle.0.swap_remove(i));
         if let Some(Idle(_, bytes)) = &taken {
             idle.1 -= bytes;
         }
@@ -263,7 +266,7 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => crate::host::host().and_then(|h| h.new_list_for(kind).ok()),
     }
 }
 
@@ -327,7 +330,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
-    let Some(fresh) = fresh_list() else {
+    let Some(fresh) = fresh_list(list.kind) else {
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -404,7 +407,9 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // SAFETY: one of our lists.
+        let list_kind = unsafe { (*this.cast::<List>()).kind };
+        let Some(fresh) = fresh_list(list_kind) else {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
@@ -476,7 +481,9 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // SAFETY: one of our lists.
+        let list_kind = unsafe { (*this.cast::<List>()).kind };
+        let Some(fresh) = fresh_list(list_kind) else {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
@@ -607,7 +614,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list_for(kind) {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -728,7 +735,14 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             let wanted = crate::host::texture_state(b.last as u32);
             let (texture, before) = list.transition(b.first, wanted)?;
             let after = crate::host::legal_state(texture, wanted);
-            if before == after {
+            let after = if list.is_compute() {
+                crate::host::compute_legal_state(after)
+            } else {
+                after
+            };
+            if before == after
+                || (list.is_compute() && ((before | after) & crate::host::GRAPHICS_ONLY_STATES) != 0)
+            {
                 return None;
             }
             Some(Barrier {
@@ -758,16 +772,29 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             } else {
                 // A depth texture's unordered access is its colour twin's
                 // (the host gives the depth texture none): the barrier is
-                // on the texture shaders write.
-                match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
-                    None => host(b.first)?,
+                // on the texture shaders write. Never emit a non-null UAV
+                // barrier on a resource without ALLOW_UNORDERED_ACCESS.
+                let res = crate::resource::twin_resource(b.first)
+                    .or_else(|| crate::resource::host_resource(b.first));
+                match res {
+                    Some(r) if uav_capable(r) => r.as_raw().cast_const().cast(),
+                    Some(_) => std::ptr::null(),
+                    None => return None,
                 }
             },
             ..*b
         }),
         _ => None,
     }
+}
+
+#[cfg(windows)]
+#[inline]
+fn uav_capable(res: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // SAFETY: `res` is a live `ID3D12Resource`.
+    let desc = unsafe { res.GetDesc() };
+    (desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) != 0
 }
 
 /// An unordered access barrier on every resource: earlier shader writes
@@ -923,6 +950,16 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
+        let state = if list.is_compute() {
+            crate::host::compute_legal_state(state)
+        } else {
+            state
+        };
+        if state == before
+            || (list.is_compute() && ((before | state) & crate::host::GRAPHICS_ONLY_STATES) != 0)
+        {
+            return;
+        }
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture (the list's states hold
         // it).
@@ -1415,7 +1452,7 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        if unlike(dst, src) {
+        if unlike(dst, src) || list.is_compute() {
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
@@ -1482,6 +1519,9 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
+        if list.is_compute() {
+            return;
+        }
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1533,6 +1573,9 @@ extern "system" fn clear_dsv(
         else {
             return;
         };
+        if list.is_compute() {
+            return;
+        }
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1674,6 +1717,116 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct GuestBarrierGroup {
+    pub(crate) kind: u32,
+    pub(crate) count: u32,
+    pub(crate) barriers: u64,
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<GuestBarrierGroup>() == 16);
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GuestGlobalBarrier {
+    sync_before: u32,
+    sync_after: u32,
+    access_before: u32,
+    access_after: u32,
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<GuestGlobalBarrier>() == 16);
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GuestBufferBarrier {
+    sync_before: u32,
+    sync_after: u32,
+    access_before: u32,
+    access_after: u32,
+    resource: This,
+    offset: u64,
+    size: u64,
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<GuestBufferBarrier>() == 40);
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GuestTextureBarrier {
+    sync_before: u32,
+    sync_after: u32,
+    access_before: u32,
+    access_after: u32,
+    layout_before: u32,
+    layout_after: u32,
+    resource: This,
+    subresource_range: [u32; 6],
+    flags: u32,
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<GuestTextureBarrier>() == 64);
+
+#[cfg(windows)]
+#[inline]
+fn is_read_only_access(access: u32) -> bool {
+    // D3D12_BARRIER_ACCESS read-only bits: VERTEX_BUFFER(1), CONSTANT_BUFFER(2),
+    // INDEX_BUFFER(4), DEPTH_STENCIL_READ(0x40), SHADER_RESOURCE(0x80),
+    // INDIRECT_ARGUMENT(0x200), COPY_SOURCE(0x800), RESOLVE_SOURCE(0x1000),
+    // SHADING_RATE_SOURCE(0x8000). COMMON(0) and NO_ACCESS(0x8000_0000) are not
+    // treated as read-only here.
+    const READ_ONLY: u32 = 0x1 | 0x2 | 0x4 | 0x40 | 0x80 | 0x200 | 0x800 | 0x1000 | 0x8000;
+    access != 0 && (access & !READ_ONLY) == 0
+}
+
+#[cfg(windows)]
+fn sanitize_buffer_barrier_fields(
+    sync_before: u32,
+    sync_after: u32,
+    access_before: u32,
+    access_after: u32,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_SYNC,
+    windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_SYNC,
+    windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_ACCESS,
+    windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_ACCESS,
+)> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BARRIER_ACCESS, D3D12_BARRIER_SYNC_ALL,
+    };
+    if sync_before == 0
+        || sync_after == 0
+        || access_before == 0x8000_0000
+        || access_after == 0x8000_0000
+    {
+        return None;
+    }
+    // Strictly limit to COMMON(0), UNORDERED_ACCESS(0x10), SHADER_RESOURCE(0x80),
+    // INDIRECT_ARGUMENT(0x200), COPY_DEST(0x400), COPY_SOURCE(0x800).
+    const ALLOWED: u32 = 0x10 | 0x80 | 0x200 | 0x400 | 0x800;
+    const WRITE_BITS: u32 = 0x10 | 0x400;
+    let sanitize_access = |access: u32| -> D3D12_BARRIER_ACCESS {
+        let masked = access & ALLOWED;
+        if (masked & WRITE_BITS) != 0 && masked != 0x10 && masked != 0x400 {
+            // D3D12 forbids combining a write access bit with any other bit; use COMMON(0).
+            D3D12_BARRIER_ACCESS(0)
+        } else {
+            D3D12_BARRIER_ACCESS(masked as i32)
+        }
+    };
+    Some((
+        D3D12_BARRIER_SYNC_ALL,
+        D3D12_BARRIER_SYNC_ALL,
+        sanitize_access(access_before),
+        sanitize_access(access_after),
+    ))
+}
+
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. The host orders
 /// nothing between dispatches by itself: what shaders wrote is waited for
@@ -1686,10 +1839,9 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
     {
         with_state(this, |l, state| state.synced_on(l, true));
         if let Some(list) = host_list(this) {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            use windows::Win32::Graphics::Direct3D12::*;
             #[cfg(feature = "diagnostics")]
             {
-                // The shapes of the title's calls, each once.
                 static SEEN: std::sync::Mutex<Vec<(u32, u32, bool)>> = std::sync::Mutex::new(Vec::new());
                 let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
                 let shape = (flags, control, address == 0);
@@ -1704,6 +1856,45 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                     );
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+            }
+            let enhanced = crate::host::host().is_some_and(|h| h.enhanced_barriers());
+            let shadow = (address != 0).then(|| crate::shadow::find(address, size.max(1))).flatten();
+            if let Some(shadow) = shadow {
+                list.keep(&shadow.buffer);
+                if enhanced {
+                    let buf = [D3D12_BUFFER_BARRIER {
+                        SyncBefore: D3D12_BARRIER_SYNC_ALL,
+                        SyncAfter: D3D12_BARRIER_SYNC_ALL,
+                        AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                        AccessAfter: D3D12_BARRIER_ACCESS_COMMON,
+                        // SAFETY: borrowed pointer kept alive by `list.keep(&shadow.buffer)`.
+                        pResource: std::mem::ManuallyDrop::new(Some(unsafe {
+                            std::mem::transmute_copy(&shadow.buffer)
+                        })),
+                        Offset: 0,
+                        Size: u64::MAX,
+                    }];
+                    let group = [D3D12_BARRIER_GROUP {
+                        Type: D3D12_BARRIER_TYPE_BUFFER,
+                        NumBarriers: 1,
+                        Anonymous: D3D12_BARRIER_GROUP_0 {
+                            pBufferBarriers: buf.as_ptr(),
+                        },
+                    }];
+                    // SAFETY: an open list and live buffer kept on it.
+                    if unsafe { list.list.enhanced_barriers(&group) } {
+                        return;
+                    }
+                }
+                if uav_capable(&shadow.buffer) {
+                    let mut b = UAV_BARRIER;
+                    b.first = windows::core::Interface::as_raw(&shadow.buffer) as This;
+                    // SAFETY: same layout as `D3D12_RESOURCE_BARRIER`; buffer kept on `list`.
+                    let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(b) };
+                    // SAFETY: an open list.
+                    unsafe { list.list.barriers(&[barrier]) };
+                    return;
+                }
             }
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
@@ -2258,12 +2449,59 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+#[cfg(windows)]
+fn read_guest_array<T: Copy>(
+    ptr: *const u8,
+    count: usize,
+    trusted: bool,
+    out: &mut Vec<T>,
+) -> bool {
+    if count == 0 {
+        out.clear();
+        return true;
+    }
+    out.clear();
+    if trusted {
+        out.reserve(count);
+        for i in 0..count {
+            // SAFETY: `trusted` means `ptr` points to a Rust slice of at least `count * size_of::<T>()` bytes.
+            out.push(unsafe { std::ptr::read_unaligned(ptr.add(i * size_of::<T>()).cast()) });
+        }
+        return true;
+    }
+    let bytes_len = count * size_of::<T>();
+    let mut stack = [0u8; 1024];
+    let mut heap = Vec::new();
+    let buf = if bytes_len <= stack.len() {
+        &mut stack[..bytes_len]
+    } else {
+        heap.resize(bytes_len, 0);
+        &mut heap[..]
+    };
+    if !crate::host::read_into(ptr, buf) {
+        return false;
+    }
+    out.reserve(count);
+    for i in 0..count {
+        // SAFETY: `buf` holds `count * size_of::<T>()` initialized bytes.
+        out.push(unsafe { std::ptr::read_unaligned(buf.as_ptr().add(i * size_of::<T>()).cast()) });
+    }
+    true
+}
+
+#[cfg(windows)]
+pub(super) fn barrier_groups_trusted(this: This, groups: &[GuestBarrierGroup]) {
+    barrier_groups_inner(this, groups.len() as u32, groups.as_ptr().cast(), true);
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
-/// global barriers with layouts instead of states. Every host use of a
-/// title texture (clears, copies) moves its host copy to the state it needs
-/// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+/// global barriers decoded from the Scarlett 16-byte group / 40-byte buffer
+/// ABI onto `ID3D12GraphicsCommandList7::Barrier`, skipping read-only no-ops.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    barrier_groups_inner(this, count, groups, false);
+}
+
+fn barrier_groups_inner(this: This, count: u32, groups: *const u8, trusted: bool) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2276,15 +2514,182 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        use windows::Win32::Graphics::Direct3D12::*;
+        if groups.is_null() {
+            with_state(this, |l, state| state.synced_on(l, true));
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.barriers(&[barrier]) };
+            return;
+        }
+        let enhanced = crate::host::host().is_some_and(|h| h.enhanced_barriers());
+        const UNORDERED_ACCESS: u32 = 0x10;
+        let mut guest_groups: Vec<GuestBarrierGroup> = Vec::new();
+        let n_groups = (count as usize).min(256);
+        if !read_guest_array(groups, n_groups, trusted, &mut guest_groups) {
+            with_state(this, |l, state| state.synced_on(l, true));
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            unsafe { list.list.barriers(&[barrier]) };
+            return;
+        }
+        let mut host_buffers: Vec<D3D12_BUFFER_BARRIER> = Vec::new();
+        let mut kept_shadows: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
+        let mut legacy_uavs: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+        let mut need_global_uav = false;
+        let mut fallback_all = false;
+        let mut globals_buf: Vec<GuestGlobalBarrier> = Vec::new();
+        let mut textures_buf: Vec<GuestTextureBarrier> = Vec::new();
+        let mut buffers_buf: Vec<GuestBufferBarrier> = Vec::new();
+        for g in guest_groups {
+            if g.count == 0 || g.barriers == 0 {
+                continue;
+            }
+            let b_ptr = g.barriers as *const u8;
+            let n_barriers = (g.count as usize).min(2048);
+            match g.kind {
+                0 => {
+                    if !read_guest_array(b_ptr, n_barriers, trusted, &mut globals_buf) {
+                        fallback_all = true;
+                        break;
+                    }
+                    for gb in &globals_buf {
+                        if is_read_only_access(gb.access_before) && is_read_only_access(gb.access_after) {
+                            continue;
+                        }
+                        if ((gb.access_before | gb.access_after) & UNORDERED_ACCESS) != 0 {
+                            need_global_uav = true;
+                        }
+                    }
+                }
+                1 => {
+                    if !read_guest_array(b_ptr, n_barriers, trusted, &mut textures_buf) {
+                        fallback_all = true;
+                        break;
+                    }
+                    for tb in &textures_buf {
+                        if is_read_only_access(tb.access_before) && is_read_only_access(tb.access_after) {
+                            continue;
+                        }
+                        if ((tb.access_before | tb.access_after) & UNORDERED_ACCESS) == 0 {
+                            continue;
+                        }
+                        let tex = crate::resource::twin_resource(tb.resource)
+                            .or_else(|| crate::resource::host_resource(tb.resource));
+                        if let Some(tex) = tex
+                            && uav_capable(tex)
+                        {
+                            list.keep(tex);
+                            let mut b = UAV_BARRIER;
+                            b.first = windows::core::Interface::as_raw(tex) as This;
+                            // SAFETY: `Barrier` matches `D3D12_RESOURCE_BARRIER`.
+                            legacy_uavs.push(unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(b) });
+                        } else {
+                            need_global_uav = true;
+                        }
+                    }
+                }
+                2 => {
+                    if !read_guest_array(b_ptr, n_barriers, trusted, &mut buffers_buf) {
+                        fallback_all = true;
+                        break;
+                    }
+                    for bb in &buffers_buf {
+                        if is_read_only_access(bb.access_before) && is_read_only_access(bb.access_after) {
+                            continue;
+                        }
+                        let resolved = crate::resource::buffer_bytes(bb.resource)
+                            .and_then(|(ptr, sz)| crate::shadow::find(ptr as u64, sz.max(1)));
+                        if let Some(shadow) = resolved {
+                            list.keep(&shadow.buffer);
+                            if bb.offset == 0
+                                && (bb.size == u64::MAX || bb.size > 0)
+                                && let Some((sb, sa, ab, aa)) = sanitize_buffer_barrier_fields(
+                                    bb.sync_before,
+                                    bb.sync_after,
+                                    bb.access_before,
+                                    bb.access_after,
+                                )
+                            {
+                                host_buffers.push(D3D12_BUFFER_BARRIER {
+                                    SyncBefore: sb,
+                                    SyncAfter: sa,
+                                    AccessBefore: ab,
+                                    AccessAfter: aa,
+                                    // SAFETY: `shadow` is kept in `kept_shadows` and `list.keep`.
+                                    pResource: std::mem::ManuallyDrop::new(Some(unsafe {
+                                        std::mem::transmute_copy(&shadow.buffer)
+                                    })),
+                                    Offset: 0,
+                                    Size: u64::MAX,
+                                });
+                            } else if uav_capable(&shadow.buffer) {
+                                let mut uav = UAV_BARRIER;
+                                uav.first = windows::core::Interface::as_raw(&shadow.buffer) as This;
+                                // SAFETY: `Barrier` matches `D3D12_RESOURCE_BARRIER`.
+                                legacy_uavs.push(unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(uav) });
+                            } else if ((bb.access_before | bb.access_after) & UNORDERED_ACCESS) != 0 {
+                                need_global_uav = true;
+                            }
+                            kept_shadows.push(shadow);
+                        } else if ((bb.access_before | bb.access_after) & UNORDERED_ACCESS) != 0 {
+                            need_global_uav = true;
+                        }
+                    }
+                }
+                _ => {
+                    fallback_all = true;
+                    break;
+                }
+            }
+        }
+        if fallback_all {
+            with_state(this, |l, state| state.synced_on(l, true));
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            unsafe { list.list.barriers(&[barrier]) };
+            return;
+        }
+        if host_buffers.is_empty() && legacy_uavs.is_empty() && !need_global_uav {
+            // Read-only transitions need no UAV flush.
+            return;
+        }
         with_state(this, |l, state| state.synced_on(l, true));
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.barriers(&[barrier]) };
+        let mut emitted_enhanced = false;
+        if enhanced && !host_buffers.is_empty() {
+            let group = [D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_BUFFER,
+                NumBarriers: host_buffers.len() as u32,
+                Anonymous: D3D12_BARRIER_GROUP_0 {
+                    pBufferBarriers: host_buffers.as_ptr(),
+                },
+            }];
+            // SAFETY: `host_buffers` is non-empty, `pBufferBarriers` is non-null, and buffers are kept on `list`.
+            emitted_enhanced = unsafe { list.list.enhanced_barriers(&group) };
+        }
+        if !emitted_enhanced {
+            for b in &host_buffers {
+                if let Some(r) = b.pResource.as_ref()
+                    && uav_capable(r)
+                {
+                    let mut uav = UAV_BARRIER;
+                    uav.first = windows::core::Interface::as_raw(r) as This;
+                    legacy_uavs.push(unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(uav) });
+                } else {
+                    need_global_uav = true;
+                }
+            }
+        }
+        if need_global_uav {
+            legacy_uavs.push(unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) });
+        }
+        if !legacy_uavs.is_empty() {
+            // SAFETY: an open list; all referenced resources are kept on `list`.
+            unsafe { list.list.barriers(&legacy_uavs) };
+        }
+        drop(kept_shadows);
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups, trusted);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2343,7 +2748,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list(list.kind) else {
             return;
         };
         current.close();
@@ -2362,6 +2767,20 @@ fn value_written(this: This, address: u64, value: u64) {
     }
     #[cfg(not(windows))]
     let _ = (this, address, value);
+}
+
+/// Records a deferred 64-bit value write on the command list timeline
+/// (or writes immediately when no host GPU / thin recording is active).
+pub fn write_u64_deferred(this: This, address: u64, value: u64) {
+    if this.is_null() || address == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    if host_list(this).is_none() && thin::on() {
+        thin::write_u64(this, address, value);
+        return;
+    }
+    defer_write(this, address, Written::Value(value), 8);
 }
 
 fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
