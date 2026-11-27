@@ -19,7 +19,7 @@ Tested on **Windows 10/11 (x64)** with an **NVIDIA RTX A4500 (20 GB VRAM)**:
 | **3D Lighting & Shaders** | Partial | Deferred lighting, shadows, and environment geometry render; initial scene streaming warms up during the opening cutscene |
 | **Known Issues** | Active | Facial morph targets (`Dispatch` blendshapes) remain static during cutscenes; minor BC7/SSS skin detiling artifacts on character faces/forearms |
 
-> **Video Proof:** *[add your unlisted YouTube link here once uploaded]*
+> **Video Proof:** [GTA VI In-Game on NVIDIA RTX A4500 (6–12 FPS)](https://www.youtube.com/watch?v=V8ioeQRAytM)
 
 ---
 
@@ -70,4 +70,5 @@ $env:VICTORY_KBM_GTA = "1"
 ## Disclaimer
 
 This repository contains **source code only**. No copyrighted game assets, encryption keys, or precompiled executables are hosted, distributed, or linked. Licensed under **GPL-3.0**.
+
 
