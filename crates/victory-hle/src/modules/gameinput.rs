@@ -160,6 +160,14 @@ pub(crate) fn cursor_locked() -> bool {
     CURSOR_LOCKED.load(Ordering::Relaxed) && !victory_gpu::tequesta_ui::menu_open()
 }
 
+/// Overlay hotkeys (`F1` menu, `F3` HUD mode, `F4` static cache, `F5` resolution scale)
+/// are consumed by `tequesta_ui` without leaking to the game, while `F2` (`0x71`) and
+/// `` ` `` / `~` (`0xC0`) remain untouched for mouse-look capture.
+#[inline]
+pub(crate) fn is_overlay_hotkey_vk(vk: u8) -> bool {
+    matches!(vk, 0x70 | 0x72 | 0x73 | 0x74)
+}
+
 /// Parses an opt-in boolean environment variable (`1`, `true`, `yes`, `on`,
 /// ignoring surrounding whitespace and ASCII case).
 fn parse_env_flag(value: &str) -> bool {
@@ -1832,9 +1840,14 @@ mod host {
             }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
-                // mouse buttons (below 0x08).
+                // mouse buttons (below 0x08), and keep F1/F3/F4/F5 overlay hotkeys
+                // out of the title's keyboard state (leaving F2/~ mouse toggle intact).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    .filter(|vk| {
+                        !(0x10..=0x12).contains(vk)
+                            && !is_overlay_hotkey_vk(*vk)
+                            && !down.contains(vk)
+                    })
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
@@ -2770,5 +2783,17 @@ mod tests {
             fast_x >= 0.85,
             "fast continuous sweep should reach high turn rate (>=0.85), got {fast_x}"
         );
+    }
+
+    #[test]
+    fn overlay_hotkeys_are_filtered_without_affecting_f2_or_game_keys() {
+        assert!(super::is_overlay_hotkey_vk(0x70)); // F1
+        assert!(!super::is_overlay_hotkey_vk(0x71)); // F2 mouse-look toggle
+        assert!(super::is_overlay_hotkey_vk(0x72)); // F3 HUD mode
+        assert!(super::is_overlay_hotkey_vk(0x73)); // F4 static cache
+        assert!(super::is_overlay_hotkey_vk(0x74)); // F5 resolution scale
+        assert!(!super::is_overlay_hotkey_vk(0xC0)); // ` / ~ mouse-look toggle
+        assert!(!super::is_overlay_hotkey_vk(b'W'));
+        assert!(!super::is_overlay_hotkey_vk(0x1B)); // Esc
     }
 }

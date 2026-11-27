@@ -60,6 +60,18 @@ pub(crate) fn note_fence_yield() {
     STATS[4].fetch_add(1, Relaxed);
 }
 
+/// Non-destructive snapshot of `[bind_full, bind_const, direct_hit, indirect_fused, fence_yield]`.
+#[inline]
+pub(crate) fn snapshot() -> [u64; 5] {
+    [
+        STATS[0].load(Relaxed),
+        STATS[1].load(Relaxed),
+        STATS[2].load(Relaxed),
+        STATS[3].load(Relaxed),
+        STATS[4].load(Relaxed),
+    ]
+}
+
 /// Per-frame telemetry string when `perf_trace_on()` is active.
 pub(crate) fn breakdown(frames: f64) -> String {
     let f = |i: usize| STATS[i].swap(0, Relaxed) as f64 / frames;

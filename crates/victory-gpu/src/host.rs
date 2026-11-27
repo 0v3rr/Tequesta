@@ -7673,7 +7673,7 @@ impl HostList {
         if !barriers.is_empty() {
             // SAFETY: an open list and live buffers this recording left in
             // `INDIRECT_ARGUMENT`.
-            unsafe { self.list.ResourceBarrier(&barriers) };
+            unsafe { self.list.barriers(&barriers) };
         }
     }
 
@@ -7698,7 +7698,7 @@ impl HostList {
         );
         // SAFETY: an open list and a live buffer this recording left in
         // `INDIRECT_ARGUMENT`.
-        unsafe { self.list.ResourceBarrier(&[barrier]) };
+        unsafe { self.list.barriers(&[barrier]) };
     }
 
     /// The state the list's indirect scratch buffer `scratch` is in at this

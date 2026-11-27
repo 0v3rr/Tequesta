@@ -23,8 +23,8 @@ use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_LBUTTON, VK_LEFT, VK_RETURN, VK_RIGHT,
-    VK_SPACE, VK_UP,
+    GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_F3, VK_F4, VK_F5, VK_LBUTTON, VK_LEFT,
+    VK_MENU, VK_RETURN, VK_RIGHT, VK_SPACE, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, HTCLIENT, PostMessageW,
@@ -37,9 +37,11 @@ use crate::host::{Host, HostList, transition};
 pub const WM_APP_DISPLAY_MODE: u32 = 0x8000 + 0x54;
 
 const MENU_W: u32 = 760;
-const MENU_H: u32 = 660;
-const HUD_W: u32 = 176;
+const MENU_H: u32 = 704;
+const HUD_W: u32 = 188;
 const HUD_H: u32 = 30;
+const DETAIL_HUD_W: u32 = 368;
+const DETAIL_HUD_H: u32 = 82;
 const UPLOADS: usize = 4;
 
 const BG: [u8; 3] = [15, 14, 24];
@@ -444,19 +446,176 @@ impl Surface {
     }
 }
 
-const ROW_COUNT: usize = 16;
-const BTN_Y: u32 = 586;
+#[cfg(test)]
+const ROW_COUNT: usize = 19;
+const PRESET_Y: u32 = 54;
+const PRESET_H: u32 = 32;
+const PRESET_W: u32 = 228;
+const PRESET_XS: [u32; 3] = [24, 266, 508];
+const BTN_Y: u32 = 628;
 const BTN1_X: u32 = 24;
 const BTN1_W: u32 = 420;
 const BTN2_X: u32 = 464;
 const BTN2_W: u32 = 272;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Preset {
+    MaxFps,
+    BalancedRtx,
+    Quality,
+}
+
+impl Preset {
+    const ALL: [Self; 3] = [Self::MaxFps, Self::BalancedRtx, Self::Quality];
+
+    fn from_row(row: usize) -> Option<Self> {
+        match row {
+            0 => Some(Self::MaxFps),
+            1 => Some(Self::BalancedRtx),
+            2 => Some(Self::Quality),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::MaxFps => "MAX FPS",
+            Self::BalancedRtx => "BALANCED RTX",
+            Self::Quality => "QUALITY",
+        }
+    }
+}
+
+fn apply_preset(cfg: &mut TequestaConfig, preset: Preset) -> bool {
+    let was_launch = (
+        cfg.resolution_scale,
+        cfg.kbm_native,
+        cfg.shader_prewarm,
+        cfg.pipeline_precache,
+        cfg.thin_lists,
+        cfg.join_parts,
+        cfg.raw_views,
+    );
+    cfg.port_static = true;
+    cfg.thin_lists = true;
+    cfg.join_parts = 8;
+    cfg.card_rehash_runs = true;
+    cfg.raw_views = false;
+    cfg.shader_prewarm = true;
+    cfg.pipeline_precache = true;
+    cfg.fps_cap = 0;
+    match preset {
+        Preset::MaxFps => {
+            cfg.resolution_scale = 50;
+            cfg.ambient_gi = false;
+            cfg.reflection_probe_guard = false;
+        }
+        Preset::BalancedRtx => {
+            cfg.resolution_scale = 75;
+            cfg.ambient_gi = true;
+            cfg.reflection_probe_guard = false;
+        }
+        Preset::Quality => {
+            cfg.resolution_scale = 100;
+            cfg.ambient_gi = true;
+            cfg.reflection_probe_guard = true;
+        }
+    }
+    let now_launch = (
+        cfg.resolution_scale,
+        cfg.kbm_native,
+        cfg.shader_prewarm,
+        cfg.pipeline_precache,
+        cfg.thin_lists,
+        cfg.join_parts,
+        cfg.raw_views,
+    );
+    was_launch != now_launch
+}
+
+fn active_preset(cfg: &TequestaConfig) -> Option<Preset> {
+    if !cfg.port_static
+        || !cfg.thin_lists
+        || cfg.join_parts != 8
+        || !cfg.card_rehash_runs
+        || cfg.raw_views
+        || !cfg.shader_prewarm
+        || !cfg.pipeline_precache
+        || cfg.fps_cap != 0
+    {
+        return None;
+    }
+    match (cfg.resolution_scale, cfg.ambient_gi, cfg.reflection_probe_guard) {
+        (50, false, false) => Some(Preset::MaxFps),
+        (75, true, false) => Some(Preset::BalancedRtx),
+        (100, true, true) => Some(Preset::Quality),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HudMode {
+    Off,
+    Compact,
+    Detailed,
+}
+
+impl HudMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Compact,
+            Self::Compact => Self::Detailed,
+            Self::Detailed => Self::Off,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavKey {
+    Up,
+    Down,
+    Left,
+    Right,
+    Activate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavAction {
+    Move(usize),
+    Adjust(usize, i32),
+}
+
+fn nav_step(selected: usize, key: NavKey) -> NavAction {
+    match (selected, key) {
+        (0..=2, NavKey::Left) => NavAction::Move((selected + 2) % 3),
+        (0..=2, NavKey::Right) => NavAction::Move((selected + 1) % 3),
+        (0..=2, NavKey::Up) => NavAction::Move(17),
+        (0..=2, NavKey::Down) => NavAction::Move(3),
+        (0..=2, NavKey::Activate) => NavAction::Adjust(selected, 1),
+
+        (3..=16, NavKey::Up) => NavAction::Move(if selected == 3 { 0 } else { selected - 1 }),
+        (3..=16, NavKey::Down) => NavAction::Move(selected + 1),
+        (3..=16, NavKey::Left) => NavAction::Adjust(selected, -1),
+        (3..=16, NavKey::Right) | (3..=16, NavKey::Activate) => NavAction::Adjust(selected, 1),
+
+        (17 | 18, NavKey::Left) | (17 | 18, NavKey::Right) => {
+            NavAction::Move(if selected == 17 { 18 } else { 17 })
+        }
+        (17 | 18, NavKey::Up) => NavAction::Move(16),
+        (17 | 18, NavKey::Down) => NavAction::Move(0),
+        (17 | 18, NavKey::Activate) => NavAction::Adjust(selected, 1),
+
+        _ => NavAction::Move(0),
+    }
+}
+
 /// Row y-coordinates inside the `MENU_W x MENU_H` canvas.
 const fn row_y(idx: usize) -> u32 {
     match idx {
-        0..=6 => 80 + (idx as u32) * 33,
-        7..=13 => 345 + ((idx - 7) as u32) * 33,
-        14 | 15 => BTN_Y,
+        0..=2 => PRESET_Y,
+        3..=9 => 120 + ((idx - 3) as u32) * 33,
+        10..=16 => 386 + ((idx - 10) as u32) * 33,
+        17 | 18 => BTN_Y,
         _ => 0,
     }
 }
@@ -512,12 +671,39 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     let tag_col = if pending_restart { AMBER } else { TEAL };
     c.text(MENU_W - 24 - (tag.len() as u32 * 12), 18, 2, tag_col, tag);
 
-    c.text(24, 56, 2, AMBER, "LIVE SETTINGS");
-    c.rect(24, 73, 160, 1, BORDER);
+    let active = active_preset(cfg);
+    for (idx, preset) in Preset::ALL.iter().enumerate() {
+        let px = PRESET_XS[idx];
+        let is_sel = selected == idx;
+        let is_act = active == Some(*preset);
+        let fill = if is_sel {
+            ROW_HL
+        } else if is_act {
+            HEADER_BG
+        } else {
+            BG
+        };
+        let border = if is_sel {
+            CORAL
+        } else if is_act {
+            TEAL
+        } else {
+            BORDER
+        };
+        let text_col = if is_act { TEAL } else { WHITE };
+        c.rect(px, PRESET_Y, PRESET_W, PRESET_H, fill);
+        c.border(px, PRESET_Y, PRESET_W, PRESET_H, border);
+        let label = preset.label();
+        let tx = px + PRESET_W.saturating_sub(label.len() as u32 * 12) / 2;
+        c.text(tx, PRESET_Y + 9, 2, text_col, label);
+    }
+
+    c.text(24, 96, 2, AMBER, "LIVE SETTINGS");
+    c.rect(24, 113, 160, 1, BORDER);
     draw_menu_row(
         &mut c,
         selected,
-        0,
+        3,
         "DISPLAY MODE",
         "SWITCH BORDERLESS WINDOW AND WINDOWED MODE LIVE",
         if cfg.borderless_fullscreen { "BORDERLESS" } else { "WINDOWED" },
@@ -527,7 +713,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        1,
+        4,
         "MOUSE SENSITIVITY",
         "CAMERA TURN GAIN FOR SMOOTH RAW MOUSE LOOK",
         &sens_str,
@@ -541,7 +727,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        2,
+        5,
         "FRAME RATE CAP",
         "LIMIT OUTPUT FPS FOR STEADIER FRAME PACING",
         fps_str,
@@ -550,7 +736,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        3,
+        6,
         "STATIC DRAW CACHE",
         "CACHE REPEATED DRAW STATE AND DESCRIPTORS FOR FPS",
         if cfg.port_static { "ON" } else { "OFF" },
@@ -559,7 +745,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        4,
+        7,
         "AMBIENT INDIRECT LIGHT",
         "ESTIMATE INDOOR GLOBAL ILLUMINATION WITHOUT RT",
         if cfg.ambient_gi { "ON" } else { "OFF" },
@@ -568,7 +754,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        5,
+        8,
         "REFLECTION & PROBE GUARD",
         "SOFTEN VOLUMETRIC FOG AND STALE PROBE FLASHES",
         if cfg.reflection_probe_guard { "ON" } else { "OFF" },
@@ -577,21 +763,21 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        6,
+        9,
         "PERFORMANCE HUD",
         "SHOW COMPACT FPS AND FRAMETIME IN TOP-RIGHT",
         if cfg.show_fps_hud { "ON" } else { "OFF" },
         if cfg.show_fps_hud { TEAL } else { MUTED },
     );
 
-    c.rect(20, 315, MENU_W - 40, 1, BORDER);
-    c.text(24, 323, 2, CORAL, "LAUNCH SETTINGS - RESTART REQUIRED");
+    c.rect(20, 356, MENU_W - 40, 1, BORDER);
+    c.text(24, 364, 2, CORAL, "LAUNCH SETTINGS - RESTART REQUIRED");
 
     let res_str = format!("{}%", cfg.resolution_scale);
     draw_menu_row(
         &mut c,
         selected,
-        7,
+        10,
         "RESOLUTION SCALE",
         "INTERNAL DISPLAY RESOLUTION SCALE OF 1080P",
         &res_str,
@@ -600,7 +786,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        8,
+        11,
         "NATIVE KEYBOARD & MOUSE",
         "ENABLE RAW MOUSE LOOK AND AZERTY/QWERTY SCANCODES",
         if cfg.kbm_native { "ON" } else { "OFF" },
@@ -609,7 +795,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        9,
+        12,
         "SHADER PRELOAD",
         "PRECOMPILE SHADERS AT LAUNCH TO CUT STUTTER",
         if cfg.shader_prewarm { "ON" } else { "OFF" },
@@ -618,7 +804,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        10,
+        13,
         "PIPELINE CACHE",
         "CACHE COMPILED D3D12 PIPELINES ON DISK",
         if cfg.pipeline_precache { "ON" } else { "OFF" },
@@ -627,7 +813,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        11,
+        14,
         "PARALLEL COMMAND LISTS",
         "TRANSLATE COMMAND LISTS ACROSS CPU WORKER THREADS",
         if cfg.thin_lists { "ON" } else { "OFF" },
@@ -637,7 +823,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        12,
+        15,
         "TRANSLATION WORKERS",
         "CPU WORKER COUNT FOR GPU COMMAND TRANSLATION",
         &workers_str,
@@ -646,7 +832,7 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     draw_menu_row(
         &mut c,
         selected,
-        13,
+        16,
         "DIRECT GPU VIEWS",
         "DISABLE ARENA POOLING - KEEP OFF ON NVIDIA GPUS",
         if cfg.raw_views { "ON" } else { "OFF" },
@@ -654,17 +840,20 @@ fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> C
     );
 
     // Bottom action buttons.
-    c.rect(BTN1_X, BTN_Y, BTN1_W, 36, if selected == 14 { BTN_RESTART_HL } else { BTN_RESTART });
-    c.border(BTN1_X, BTN_Y, BTN1_W, 36, if selected == 14 { CORAL } else { BORDER });
+    c.rect(BTN1_X, BTN_Y, BTN1_W, 36, if selected == 17 { BTN_RESTART_HL } else { BTN_RESTART });
+    c.border(BTN1_X, BTN_Y, BTN1_W, 36, if selected == 17 { CORAL } else { BORDER });
     c.text(BTN1_X + 120, BTN_Y + 11, 2, WHITE, "APPLY & RESTART");
 
-    c.rect(BTN2_X, BTN_Y, BTN2_W, 36, if selected == 15 { BTN_QUIT_HL } else { BTN_QUIT });
-    c.border(BTN2_X, BTN_Y, BTN2_W, 36, if selected == 15 { CORAL } else { BORDER });
+    c.rect(BTN2_X, BTN_Y, BTN2_W, 36, if selected == 18 { BTN_QUIT_HL } else { BTN_QUIT });
+    c.border(BTN2_X, BTN_Y, BTN2_W, 36, if selected == 18 { CORAL } else { BORDER });
     c.text(BTN2_X + 82, BTN_Y + 11, 2, WHITE, "QUIT GAME");
 
-    let hint = "F1: CLOSE     UP/DOWN: SELECT     LEFT/RIGHT/ENTER: CHANGE";
-    let hint_x = MENU_W.saturating_sub(hint.len() as u32 * 6) / 2;
-    c.text(hint_x, MENU_H - 22, 1, MUTED, hint);
+    let hint1 = "F1/ESC: MENU   ARROWS: MOVE/CHANGE   ENTER: APPLY";
+    let hint1_x = MENU_W.saturating_sub(hint1.len() as u32 * 6) / 2;
+    c.text(hint1_x, MENU_H - 30, 1, MUTED, hint1);
+    let hint2 = "F3: HUD MODE   F4: STATIC CACHE   F5: RES SCALE   F2/~: MOUSE";
+    let hint2_x = MENU_W.saturating_sub(hint2.len() as u32 * 6) / 2;
+    c.text(hint2_x, MENU_H - 16, 1, MUTED, hint2);
     c
 }
 
@@ -683,59 +872,153 @@ fn paint_hud(fps: f32, frame_ms: f32) -> Canvas {
     c
 }
 
+#[allow(clippy::too_many_arguments)]
+fn paint_hud_detailed(
+    fps: f32,
+    frame_ms: f32,
+    draws_per_s: u64,
+    dispatches_per_s: u64,
+    bind_hits_per_s: u64,
+    dir_hits_per_s: u64,
+    res_scale: u32,
+    static_on: bool,
+) -> Canvas {
+    let mut c = Canvas::new(DETAIL_HUD_W, DETAIL_HUD_H, BG);
+    c.border(0, 0, DETAIL_HUD_W, DETAIL_HUD_H, BORDER);
+    c.rect(1, 1, DETAIL_HUD_W - 2, 2, CORAL);
+    let col = if fps >= 25.0 {
+        TEAL
+    } else if fps >= 12.0 {
+        AMBER
+    } else {
+        CORAL
+    };
+    let line1 = format!("{fps:4.1} FPS  {frame_ms:4.1}MS  {res_scale}%");
+    c.text(10, 8, 2, col, &line1);
+    let line2 = format!(
+        "DRAWS/S {draws_per_s}  DISP/S {dispatches_per_s}"
+    );
+    c.text(10, 32, 1, WHITE, &line2);
+    let line3 = format!(
+        "STATIC {}  BIND/S {}  DIR/S {}",
+        if static_on { "ON" } else { "OFF" },
+        bind_hits_per_s,
+        dir_hits_per_s,
+    );
+    c.text(10, 46, 1, TEAL, &line3);
+    c.text(10, 62, 1, MUTED, "F3:HUD  F4:STATIC  F5:RES  F1:MENU");
+    c
+}
+
+fn paint_toast(msg: &str) -> Canvas {
+    let mut c = Canvas::new(DETAIL_HUD_W, HUD_H, HEADER_BG);
+    c.border(0, 0, DETAIL_HUD_W, HUD_H, CORAL);
+    c.text(10, 8, 2, AMBER, msg);
+    c
+}
+
 /// Swapchain overlay state owned by `Presenter`.
 pub(crate) struct TequestaOverlay {
     selected: usize,
     pending_restart: bool,
+    hud_mode: HudMode,
     f1_was_down: bool,
+    f3_was_down: bool,
+    f4_was_down: bool,
+    f5_was_down: bool,
     up_was: bool,
     down_was: bool,
     left_was: bool,
     right_was: bool,
     enter_was: bool,
+    space_was: bool,
     esc_was: bool,
     lmb_was: bool,
     dirty_menu: bool,
     last_hud: Instant,
+    prev_draws: u64,
+    prev_dispatches: u64,
+    prev_static: [u64; 5],
+    toast: Option<(String, Instant)>,
     menu_surf: Option<Surface>,
     hud_surf: Option<Surface>,
+    detail_hud_surf: Option<Surface>,
+    toast_surf: Option<Surface>,
 }
 
 impl TequestaOverlay {
     pub(crate) fn new() -> Self {
         ensure_init();
+        let hud_mode = if show_fps_hud() {
+            HudMode::Compact
+        } else {
+            HudMode::Off
+        };
         Self {
             selected: 0,
             pending_restart: false,
+            hud_mode,
             f1_was_down: false,
+            f3_was_down: false,
+            f4_was_down: false,
+            f5_was_down: false,
             up_was: false,
             down_was: false,
             left_was: false,
             right_was: false,
             enter_was: false,
+            space_was: false,
             esc_was: false,
             lmb_was: false,
             dirty_menu: true,
             last_hud: Instant::now() - Duration::from_secs(1),
+            prev_draws: crate::draw::drawn(),
+            prev_dispatches: crate::draw::dispatched(),
+            prev_static: crate::port_static::snapshot(),
+            toast: None,
             menu_surf: None,
             hud_surf: None,
+            detail_hud_surf: None,
+            toast_surf: None,
         }
+    }
+
+    fn show_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now() + Duration::from_millis(2500)));
+        self.toast_surf = None;
     }
 
     fn apply_row(&mut self, hwnd: HWND, row: usize, dir: i32) {
         let mut restart_now = false;
         let mut quit_now = false;
         let mut live_borderless = None;
+        let mut toast_msg: Option<String> = None;
         {
             let mut cfg = config_lock().lock().unwrap_or_else(|e| e.into_inner());
             let mut changed = false;
             match row {
-                0 => {
+                0..=2 => {
+                    if let Some(preset) = Preset::from_row(row) {
+                        let launch_changed = apply_preset(&mut cfg, preset);
+                        crate::port_static::set_enabled(cfg.port_static);
+                        crate::ambient::set_enabled(cfg.ambient_gi);
+                        crate::ambient::set_probe_guard(cfg.reflection_probe_guard);
+                        if let Some(a) = FPS_CAP.get() {
+                            a.store(cfg.fps_cap, Relaxed);
+                        }
+                        if launch_changed {
+                            self.pending_restart = true;
+                        }
+                        toast_msg = Some(format!("PRESET: {}", preset.label()));
+                        changed = true;
+                    }
+                }
+                3 => {
                     cfg.borderless_fullscreen = !cfg.borderless_fullscreen;
                     live_borderless = Some(cfg.borderless_fullscreen);
                     changed = true;
                 }
-                1 => {
+                4 => {
                     let step = if cfg.mouse_sensitivity >= 3.0 && (dir > 0 || cfg.mouse_sensitivity > 3.0) {
                         0.50
                     } else {
@@ -748,7 +1031,7 @@ impl TequestaOverlay {
                     }
                     changed = true;
                 }
-                2 => {
+                5 => {
                     let order = [0u32, 30, 60];
                     let pos = order.iter().position(|&v| v == cfg.fps_cap).unwrap_or(0);
                     let next = if dir < 0 { (pos + 2) % 3 } else { (pos + 1) % 3 };
@@ -758,29 +1041,34 @@ impl TequestaOverlay {
                     }
                     changed = true;
                 }
-                3 => {
+                6 => {
                     cfg.port_static = !cfg.port_static;
                     crate::port_static::set_enabled(cfg.port_static);
                     changed = true;
                 }
-                4 => {
+                7 => {
                     cfg.ambient_gi = !cfg.ambient_gi;
                     crate::ambient::set_enabled(cfg.ambient_gi);
                     changed = true;
                 }
-                5 => {
+                8 => {
                     cfg.reflection_probe_guard = !cfg.reflection_probe_guard;
                     crate::ambient::set_probe_guard(cfg.reflection_probe_guard);
                     changed = true;
                 }
-                6 => {
+                9 => {
                     cfg.show_fps_hud = !cfg.show_fps_hud;
+                    self.hud_mode = if cfg.show_fps_hud {
+                        HudMode::Compact
+                    } else {
+                        HudMode::Off
+                    };
                     if let Some(a) = SHOW_HUD.get() {
                         a.store(cfg.show_fps_hud, Relaxed);
                     }
                     changed = true;
                 }
-                7 => {
+                10 => {
                     let order = [50u32, 75, 100];
                     let pos = order.iter().position(|&v| v == cfg.resolution_scale).unwrap_or(2);
                     let next = if dir < 0 { (pos + 2) % 3 } else { (pos + 1) % 3 };
@@ -788,7 +1076,7 @@ impl TequestaOverlay {
                     self.pending_restart = true;
                     changed = true;
                 }
-                8 => {
+                11 => {
                     cfg.kbm_native = !cfg.kbm_native;
                     if let Some(a) = KBM_NATIVE.get() {
                         a.store(cfg.kbm_native, Relaxed);
@@ -796,22 +1084,22 @@ impl TequestaOverlay {
                     self.pending_restart = true;
                     changed = true;
                 }
-                9 => {
+                12 => {
                     cfg.shader_prewarm = !cfg.shader_prewarm;
                     self.pending_restart = true;
                     changed = true;
                 }
-                10 => {
+                13 => {
                     cfg.pipeline_precache = !cfg.pipeline_precache;
                     self.pending_restart = true;
                     changed = true;
                 }
-                11 => {
+                14 => {
                     cfg.thin_lists = !cfg.thin_lists;
                     self.pending_restart = true;
                     changed = true;
                 }
-                12 => {
+                15 => {
                     let order = [1u32, 4, 8];
                     let pos = order.iter().position(|&v| v == cfg.join_parts).unwrap_or(2);
                     let next = if dir < 0 { (pos + 2) % 3 } else { (pos + 1) % 3 };
@@ -819,16 +1107,16 @@ impl TequestaOverlay {
                     self.pending_restart = true;
                     changed = true;
                 }
-                13 => {
+                16 => {
                     cfg.raw_views = !cfg.raw_views;
                     self.pending_restart = true;
                     changed = true;
                 }
-                14 => {
+                17 => {
                     let _ = cfg.save();
                     restart_now = true;
                 }
-                15 => {
+                18 => {
                     quit_now = true;
                 }
                 _ => {}
@@ -836,6 +1124,9 @@ impl TequestaOverlay {
             if changed {
                 let _ = cfg.save();
             }
+        }
+        if let Some(msg) = toast_msg {
+            self.show_toast(msg);
         }
         if let Some(borderless) = live_borderless {
             apply_display_mode(hwnd, borderless);
@@ -846,6 +1137,18 @@ impl TequestaOverlay {
                 on_restart();
             } else if quit_now {
                 on_quit();
+            }
+        }
+    }
+
+    fn handle_nav(&mut self, hwnd: HWND, key: NavKey) {
+        match nav_step(self.selected, key) {
+            NavAction::Move(next) => {
+                self.selected = next;
+                self.dirty_menu = true;
+            }
+            NavAction::Adjust(row, dir) => {
+                self.apply_row(hwnd, row, dir);
             }
         }
     }
@@ -864,6 +1167,48 @@ impl TequestaOverlay {
             self.dirty_menu = true;
             notify_cursor(hwnd);
         }
+        if edge(VK_F3, &mut self.f3_was_down) {
+            self.hud_mode = self.hud_mode.next();
+            let on = self.hud_mode != HudMode::Off;
+            if let Some(a) = SHOW_HUD.get() {
+                a.store(on, Relaxed);
+            }
+            let mut cfg = config_lock().lock().unwrap_or_else(|e| e.into_inner());
+            cfg.show_fps_hud = on;
+            let _ = cfg.save();
+            drop(cfg);
+            self.last_hud = Instant::now() - Duration::from_secs(1);
+            self.dirty_menu = true;
+            let label = match self.hud_mode {
+                HudMode::Off => "HUD: OFF",
+                HudMode::Compact => "HUD: COMPACT",
+                HudMode::Detailed => "HUD: DETAILED",
+            };
+            self.show_toast(label);
+        }
+        let alt_down = ours && key_down(VK_MENU);
+        if edge(VK_F4, &mut self.f4_was_down) && !alt_down {
+            let mut cfg = config_lock().lock().unwrap_or_else(|e| e.into_inner());
+            cfg.port_static = !cfg.port_static;
+            let on = cfg.port_static;
+            crate::port_static::set_enabled(on);
+            let _ = cfg.save();
+            drop(cfg);
+            self.dirty_menu = true;
+            self.show_toast(if on { "STATIC CACHE: ON" } else { "STATIC CACHE: OFF" });
+        }
+        if edge(VK_F5, &mut self.f5_was_down) {
+            let mut cfg = config_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let order = [50u32, 75, 100];
+            let pos = order.iter().position(|&v| v == cfg.resolution_scale).unwrap_or(2);
+            cfg.resolution_scale = order[(pos + 1) % 3];
+            let scale = cfg.resolution_scale;
+            let _ = cfg.save();
+            drop(cfg);
+            self.pending_restart = true;
+            self.dirty_menu = true;
+            self.show_toast(format!("RES SCALE: {scale}% (RESTART)"));
+        }
 
         if !menu_open() {
             self.up_was = false;
@@ -871,6 +1216,7 @@ impl TequestaOverlay {
             self.left_was = false;
             self.right_was = false;
             self.enter_was = false;
+            self.space_was = false;
             self.esc_was = false;
             self.lmb_was = false;
             return;
@@ -882,21 +1228,19 @@ impl TequestaOverlay {
             return;
         }
         if edge(VK_UP, &mut self.up_was) {
-            self.selected = (self.selected + ROW_COUNT - 1) % ROW_COUNT;
-            self.dirty_menu = true;
+            self.handle_nav(hwnd, NavKey::Up);
         }
         if edge(VK_DOWN, &mut self.down_was) {
-            self.selected = (self.selected + 1) % ROW_COUNT;
-            self.dirty_menu = true;
+            self.handle_nav(hwnd, NavKey::Down);
         }
         if edge(VK_LEFT, &mut self.left_was) {
-            self.apply_row(hwnd, self.selected, -1);
+            self.handle_nav(hwnd, NavKey::Left);
         }
         if edge(VK_RIGHT, &mut self.right_was) {
-            self.apply_row(hwnd, self.selected, 1);
+            self.handle_nav(hwnd, NavKey::Right);
         }
-        if edge(VK_RETURN, &mut self.enter_was) || (ours && key_down(VK_SPACE)) {
-            self.apply_row(hwnd, self.selected, 1);
+        if edge(VK_RETURN, &mut self.enter_was) || edge(VK_SPACE, &mut self.space_was) {
+            self.handle_nav(hwnd, NavKey::Activate);
         }
 
         // Mouse hover & click inside centered menu box (scaled to swapchain size).
@@ -921,19 +1265,29 @@ impl TequestaOverlay {
                     let ly = sy - my as i32;
                     if (0..MENU_W as i32).contains(&lx) && (0..MENU_H as i32).contains(&ly) {
                         let mut hit: Option<usize> = None;
-                        for r in 0..14usize {
-                            let y0 = row_y(r) as i32 - 2;
-                            if (y0..y0 + 31).contains(&ly) {
-                                hit = Some(r);
-                                break;
+                        if (PRESET_Y as i32..(PRESET_Y + PRESET_H) as i32).contains(&ly) {
+                            for (i, &px) in PRESET_XS.iter().enumerate() {
+                                if (px as i32..(px + PRESET_W) as i32).contains(&lx) {
+                                    hit = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+                        if hit.is_none() {
+                            for r in 3..17usize {
+                                let y0 = row_y(r) as i32 - 2;
+                                if (y0..y0 + 31).contains(&ly) {
+                                    hit = Some(r);
+                                    break;
+                                }
                             }
                         }
                         let yb = BTN_Y as i32;
                         if (yb..yb + 36).contains(&ly) {
                             if (BTN1_X as i32..(BTN1_X + BTN1_W) as i32).contains(&lx) {
-                                hit = Some(14);
+                                hit = Some(17);
                             } else if (BTN2_X as i32..(BTN2_X + BTN2_W) as i32).contains(&lx) {
-                                hit = Some(15);
+                                hit = Some(18);
                             }
                         }
                         if let Some(r) = hit {
@@ -942,7 +1296,7 @@ impl TequestaOverlay {
                                 self.dirty_menu = true;
                             }
                             if clicked {
-                                let dir = if lx < (MENU_W as i32) / 2 && (r == 1 || r == 2 || r == 7 || r == 12) {
+                                let dir = if lx < (MENU_W as i32) / 2 && (r == 4 || r == 5 || r == 10 || r == 15) {
                                     -1
                                 } else {
                                     1
@@ -972,19 +1326,87 @@ impl TequestaOverlay {
         }
         self.poll_input(hwnd, width, height);
 
-        if show_fps_hud() {
-            if self.hud_surf.as_ref().is_none_or(|s| s.format != format) {
-                self.hud_surf = Surface::new(host, HUD_W, HUD_H, format);
-                self.last_hud = Instant::now() - Duration::from_secs(1);
-            }
-            if let Some(surf) = &mut self.hud_surf {
-                if self.last_hud.elapsed() >= Duration::from_millis(200) {
-                    self.last_hud = Instant::now();
-                    let canvas = paint_hud(fps, frame_ms);
-                    surf.upload(&canvas);
+        match self.hud_mode {
+            HudMode::Off => {}
+            HudMode::Compact => {
+                if self.hud_surf.as_ref().is_none_or(|s| s.format != format) {
+                    self.hud_surf = Surface::new(host, HUD_W, HUD_H, format);
+                    self.last_hud = Instant::now() - Duration::from_secs(1);
                 }
-                let hx = width.saturating_sub(HUD_W + 14);
-                surf.blit(list, back, hx, 14, width, height);
+                if let Some(surf) = &mut self.hud_surf {
+                    if self.last_hud.elapsed() >= Duration::from_millis(200) {
+                        self.last_hud = Instant::now();
+                        let canvas = paint_hud(fps, frame_ms);
+                        surf.upload(&canvas);
+                    }
+                    let hx = width.saturating_sub(HUD_W + 14);
+                    surf.blit(list, back, hx, 14, width, height);
+                }
+            }
+            HudMode::Detailed => {
+                if self.detail_hud_surf.as_ref().is_none_or(|s| s.format != format) {
+                    self.detail_hud_surf = Surface::new(host, DETAIL_HUD_W, DETAIL_HUD_H, format);
+                    self.last_hud = Instant::now() - Duration::from_secs(1);
+                }
+                if let Some(surf) = &mut self.detail_hud_surf {
+                    let elapsed = self.last_hud.elapsed();
+                    if elapsed >= Duration::from_millis(250) {
+                        let secs = elapsed.as_secs_f64().max(0.05);
+                        self.last_hud = Instant::now();
+                        let d_now = crate::draw::drawn();
+                        let disp_now = crate::draw::dispatched();
+                        let s_now = crate::port_static::snapshot();
+                        let draws_s = ((d_now.saturating_sub(self.prev_draws)) as f64 / secs) as u64;
+                        let disp_s = ((disp_now.saturating_sub(self.prev_dispatches)) as f64 / secs) as u64;
+                        let bind_s = (((s_now[0].saturating_sub(self.prev_static[0]))
+                            + (s_now[1].saturating_sub(self.prev_static[1]))) as f64
+                            / secs) as u64;
+                        let dir_s = ((s_now[2].saturating_sub(self.prev_static[2])) as f64 / secs) as u64;
+                        self.prev_draws = d_now;
+                        self.prev_dispatches = disp_now;
+                        self.prev_static = s_now;
+                        let scale = config_lock()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .resolution_scale;
+                        let canvas = paint_hud_detailed(
+                            fps,
+                            frame_ms,
+                            draws_s,
+                            disp_s,
+                            bind_s,
+                            dir_s,
+                            scale,
+                            crate::port_static::on(),
+                        );
+                        surf.upload(&canvas);
+                    }
+                    let hx = width.saturating_sub(DETAIL_HUD_W + 14);
+                    surf.blit(list, back, hx, 14, width, height);
+                }
+            }
+        }
+
+        if let Some((msg, until)) = &self.toast {
+            if Instant::now() < *until {
+                if self.toast_surf.as_ref().is_none_or(|s| s.format != format)
+                    && let Some(mut surf) = Surface::new(host, DETAIL_HUD_W, HUD_H, format)
+                {
+                    surf.upload(&paint_toast(msg));
+                    self.toast_surf = Some(surf);
+                }
+                if let Some(surf) = &mut self.toast_surf {
+                    let ty = match self.hud_mode {
+                        HudMode::Off => 14,
+                        HudMode::Compact => 14 + HUD_H + 6,
+                        HudMode::Detailed => 14 + DETAIL_HUD_H + 6,
+                    };
+                    let tx = width.saturating_sub(DETAIL_HUD_W + 14);
+                    surf.blit(list, back, tx, ty, width, height);
+                }
+            } else {
+                self.toast = None;
+                self.toast_surf = None;
             }
         }
 
@@ -1013,16 +1435,17 @@ mod tests {
 
     #[test]
     fn menu_and_hud_paint_cleanly() {
-        assert_eq!(ROW_COUNT, 16);
-        for r in 0..14 {
+        assert_eq!(ROW_COUNT, 19);
+        for r in 3..17 {
             let y0 = row_y(r);
+            assert!(y0 >= PRESET_Y + PRESET_H, "row {r} overlaps presets: {y0}");
             assert!(y0 + 31 <= BTN_Y, "row {r} overlaps buttons: {y0}");
-            if r + 1 < 14 {
+            if r + 1 < 17 {
                 let next_y0 = row_y(r + 1);
                 assert!(y0 + 31 <= next_y0, "row {r} overlaps row {}", r + 1);
             }
         }
-        assert!(BTN_Y + 36 <= MENU_H - 22, "buttons overlap footer hint");
+        assert!(BTN_Y + 36 <= MENU_H - 30, "buttons overlap footer hint");
 
         let mut cfg = TequestaConfig::default();
         assert!(cfg.shader_prewarm);
@@ -1036,11 +1459,52 @@ mod tests {
         cfg.shader_prewarm = false;
         cfg.pipeline_precache = false;
         for row in 0..ROW_COUNT {
-            let m = paint_menu(&cfg, row, row >= 7);
+            let m = paint_menu(&cfg, row, row >= 10);
             assert_eq!(m.rgb.len(), (MENU_W * MENU_H) as usize);
         }
 
         let hud = paint_hud(24.5, 40.8);
         assert_eq!(hud.rgb.len(), (HUD_W * HUD_H) as usize);
+        let dhud = paint_hud_detailed(24.5, 40.8, 3200, 900, 1400, 28000, 75, true);
+        assert_eq!(dhud.rgb.len(), (DETAIL_HUD_W * DETAIL_HUD_H) as usize);
+        let toast = paint_toast("STATIC CACHE: ON");
+        assert_eq!(toast.rgb.len(), (DETAIL_HUD_W * HUD_H) as usize);
+    }
+
+    #[test]
+    fn presets_and_keyboard_navigation_behave_cleanly() {
+        let mut cfg = TequestaConfig::default();
+        assert!(apply_preset(&mut cfg, Preset::MaxFps));
+        assert_eq!(active_preset(&cfg), Some(Preset::MaxFps));
+        assert_eq!(cfg.resolution_scale, 50);
+        assert!(!cfg.ambient_gi);
+        assert!(!cfg.raw_views);
+
+        assert!(apply_preset(&mut cfg, Preset::BalancedRtx));
+        assert_eq!(active_preset(&cfg), Some(Preset::BalancedRtx));
+        assert_eq!(cfg.resolution_scale, 75);
+        assert!(cfg.ambient_gi);
+
+        assert!(apply_preset(&mut cfg, Preset::Quality));
+        assert_eq!(active_preset(&cfg), Some(Preset::Quality));
+        assert_eq!(cfg.resolution_scale, 100);
+        assert!(cfg.reflection_probe_guard);
+
+        // Horizontal preset navigation wraps 0..=2.
+        assert_eq!(nav_step(0, NavKey::Left), NavAction::Move(2));
+        assert_eq!(nav_step(2, NavKey::Right), NavAction::Move(0));
+        assert_eq!(nav_step(1, NavKey::Down), NavAction::Move(3));
+        assert_eq!(nav_step(1, NavKey::Activate), NavAction::Adjust(1, 1));
+
+        // Bottom buttons move horizontally without triggering Restart/Quit.
+        assert_eq!(nav_step(17, NavKey::Right), NavAction::Move(18));
+        assert_eq!(nav_step(18, NavKey::Left), NavAction::Move(17));
+        assert_eq!(nav_step(17, NavKey::Down), NavAction::Move(0));
+        assert_eq!(nav_step(17, NavKey::Activate), NavAction::Adjust(17, 1));
+
+        // HUD mode cycling wraps cleanly.
+        assert_eq!(HudMode::Off.next(), HudMode::Compact);
+        assert_eq!(HudMode::Compact.next(), HudMode::Detailed);
+        assert_eq!(HudMode::Detailed.next(), HudMode::Off);
     }
 }

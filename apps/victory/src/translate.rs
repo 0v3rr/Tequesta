@@ -630,10 +630,68 @@ pub fn precompile_shaders_and_pipelines(game_dir: PathBuf, jobs: Option<usize>) 
     Ok(())
 }
 
-/// File size cap for background startup shader prewarming so multi-GB game
-/// archives are not read into memory during live gameplay.
-#[cfg(windows)]
-const STARTUP_PREWARM_MAX_FILE: u64 = 64 << 20;
+/// File size cap for background startup shader prewarming (`2 GiB`, matching
+/// `crate::shader::MAX_FILE`), read via bounded streaming windows so large
+/// game archives (`shaders.rpf`, `data.rpf`, etc.) are prewarmed with ~20 MiB
+/// peak RAM.
+#[cfg(any(windows, test))]
+const STARTUP_PREWARM_MAX_FILE: u64 = MAX_FILE;
+#[cfg(any(windows, test))]
+const STREAM_CHUNK_BYTES: usize = 16 << 20;
+#[cfg(any(windows, test))]
+const STREAM_OVERLAP_BYTES: usize = 4 << 20;
+
+#[cfg(any(windows, test))]
+fn scan_reader_streaming<R: std::io::Read, F: FnMut(&[u8])>(
+    reader: &mut R,
+    chunk_size: usize,
+    overlap: usize,
+    mut on_container: F,
+) -> std::io::Result<()> {
+    let chunk_size = chunk_size.max(1);
+    let mut buf = vec![0u8; chunk_size + overlap];
+    let mut carry = 0usize;
+    let mut saw_sgd5 = false;
+    loop {
+        let mut read_total = 0usize;
+        while read_total < chunk_size {
+            let n = reader.read(&mut buf[carry + read_total..carry + chunk_size])?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+        let window_len = carry + read_total;
+        if window_len == 0 {
+            break;
+        }
+        let window = &buf[..window_len];
+        saw_sgd5 |= victory_game::sgd5::is_sgd5(window);
+        if saw_sgd5 {
+            for rec in victory_game::sgd5::records(window) {
+                if let Some(bytes) = rec.unpack() {
+                    on_container(&bytes);
+                }
+            }
+        }
+        for off in memchr::memmem::find_iter(window, b"DXBC") {
+            let rest = &window[off..];
+            if rest.len() >= 0x20 && Container::parse(rest).is_ok() {
+                let total = u32::from_le_bytes([rest[24], rest[25], rest[26], rest[27]]) as usize;
+                if total >= 0x20 && total <= rest.len() {
+                    on_container(&rest[..total]);
+                }
+            }
+        }
+        if read_total < chunk_size {
+            break;
+        }
+        let next_carry = overlap.min(window_len);
+        buf.copy_within(window_len - next_carry..window_len, 0);
+        carry = next_carry;
+    }
+    Ok(())
+}
 
 /// Spawns a non-blocking background worker on launch that prewarms shader
 /// containers under `title_dir` into `shaders_dir` if not already completed
@@ -642,7 +700,7 @@ const STARTUP_PREWARM_MAX_FILE: u64 = 64 << 20;
 pub fn spawn_startup_shader_prewarm(title_dir: PathBuf, shaders_dir: PathBuf) {
     let dir_hash = blake3::hash(title_dir.to_string_lossy().as_bytes()).to_hex();
     let marker = shaders_dir.join(format!(
-        "startup-prewarm-v{}-{}.done",
+        "startup-prewarm-stream-v{}-{}.done",
         victory_shader::TRANSLATOR_VERSION,
         &dir_hash[..8]
     ));
@@ -658,26 +716,56 @@ pub fn spawn_startup_shader_prewarm(title_dir: PathBuf, shaders_dir: PathBuf) {
         .name("tequesta-shader-prewarm".into())
         .spawn(move || {
             let started = std::time::Instant::now();
+            let mut candidates: Vec<(bool, u64, PathBuf)> = Vec::new();
+            for entry in walkdir::WalkDir::new(&title_dir)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                let size = meta.len();
+                if size == 0 || size > STARTUP_PREWARM_MAX_FILE {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                let priority = name.contains("shader")
+                    || name.ends_with(".sgd5")
+                    || name.ends_with(".fxc")
+                    || name.ends_with(".exe")
+                    || name.ends_with(".dll");
+                candidates.push((!priority, size, entry.into_path()));
+            }
+            candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
             let mut seen = HashSet::new();
             let mut translated = 0usize;
             let mut cached = 0usize;
             let mut failed = 0usize;
-            let mut scan = FileScan::new(STARTUP_PREWARM_MAX_FILE, false);
-            for (_path, data) in scan.files(&title_dir) {
-                for job in sources(&data) {
-                    let Some(bytes) = job.bytes() else {
-                        continue;
-                    };
-                    let hash = blake3::hash(&bytes);
-                    if !seen.insert(hash) {
-                        continue;
-                    }
-                    match victory_hle::modules::d3d12x::warm_shader(&bytes) {
-                        Ok(true) => translated += 1,
-                        Ok(false) => cached += 1,
-                        Err(_) => failed += 1,
-                    }
-                }
+            for (_, _, path) in candidates {
+                let Ok(file) = std::fs::File::open(&path) else {
+                    continue;
+                };
+                let mut reader = std::io::BufReader::new(file);
+                let _ = scan_reader_streaming(
+                    &mut reader,
+                    STREAM_CHUNK_BYTES,
+                    STREAM_OVERLAP_BYTES,
+                    |bytes| {
+                        let hash = blake3::hash(bytes);
+                        if !seen.insert(hash) {
+                            return;
+                        }
+                        match victory_hle::modules::d3d12x::warm_shader(bytes) {
+                            Ok(true) => translated += 1,
+                            Ok(false) => cached += 1,
+                            Err(_) => failed += 1,
+                        }
+                    },
+                );
             }
             let summary = format!(
                 "translated={translated} cached={cached} failed={failed} elapsed_s={:.1}\n",
@@ -1213,5 +1301,28 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn streaming_scan_finds_boundary_spanning_shaders() {
+        // Minimal valid 0-part DXBC container (32 bytes).
+        let mut dxbc = vec![0u8; 32];
+        dxbc[0..4].copy_from_slice(b"DXBC");
+        dxbc[20..24].copy_from_slice(&1u32.to_le_bytes()); // version 1.0
+        dxbc[24..28].copy_from_slice(&32u32.to_le_bytes()); // total size = 32
+        dxbc[28..32].copy_from_slice(&0u32.to_le_bytes()); // part count = 0
+
+        // Place DXBC straddling the 256-byte chunk boundary (offset 240..272).
+        let mut blob = vec![0xAAu8; 400];
+        blob[240..272].copy_from_slice(&dxbc);
+
+        let mut cursor = std::io::Cursor::new(blob);
+        let mut found = std::collections::HashSet::new();
+        super::scan_reader_streaming(&mut cursor, 256, 96, |bytes| {
+            found.insert(blake3::hash(bytes));
+        })
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found.contains(&blake3::hash(&dxbc)));
     }
 }

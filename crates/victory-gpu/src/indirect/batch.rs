@@ -191,7 +191,6 @@ pub(crate) fn job(source: u32, kind: u32, times: u32) -> u32 {
 
 /// The jobs of a pass as the CPU fills them ([`SOURCE`]), and where it
 /// keeps which record is where.
-#[derive(Default)]
 pub(crate) struct Table {
     /// The table in upload memory ([`TABLE`] bytes).
     at: usize,
@@ -201,9 +200,24 @@ pub(crate) struct Table {
     /// 0: none).
     sources: [u64; SOURCES],
     /// How many executions each job is charged for so far.
-    times: Vec<u32>,
+    times: [u16; JOBS as usize],
+    /// Number of active jobs in `times`.
+    count: u32,
     /// The job of a record (source, offset, kind).
-    known: std::collections::HashMap<(u32, u32, u32), u32>,
+    known: std::collections::HashMap<(u32, u32, u32), u32, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self {
+            at: 0,
+            base: 0,
+            sources: [0; SOURCES],
+            times: [0; JOBS as usize],
+            count: 0,
+            known: Default::default(),
+        }
+    }
 }
 
 impl Table {
@@ -231,18 +245,19 @@ impl Table {
         let table = self.at as *mut u32;
         let place = |i: u32| u64::from(self.base + i * SLOT);
         if let Some(&i) = self.known.get(&key)
-            && self.times[i as usize] < TIMES
+            && u32::from(self.times[i as usize]) < TIMES
         {
             self.times[i as usize] += 1;
             // SAFETY: the job's own word of the table ([`Table::new`]).
-            unsafe { table.add(4 + 4 * i as usize).write_volatile(job(source, kind, self.times[i as usize])) };
+            unsafe { table.add(4 + 4 * i as usize).write_volatile(job(source, kind, u32::from(self.times[i as usize]))) };
             return Some(place(i));
         }
-        let i = self.times.len() as u32;
+        let i = self.count;
         if i == JOBS {
             return None;
         }
-        self.times.push(1);
+        self.times[i as usize] = 1;
+        self.count = i + 1;
         self.known.insert(key, i);
         // SAFETY: inside the table: fewer than [`JOBS`] jobs before it.
         unsafe {
@@ -293,5 +308,24 @@ pub(super) fn record(
         // Nothing else the pass writes is read before the next full wait
         // (the budget, by the next pass): only the records have to be there.
         l.ResourceBarrier(&[after]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_places_deduplicates_and_respects_limits() {
+        let mut backing = vec![0u8; TABLE as usize];
+        // SAFETY: `backing` lives for the duration of `table` and is >= `TABLE` bytes.
+        let mut table = unsafe { Table::new(backing.as_mut_ptr(), 0, [10, 20, 0, 0]) };
+        let a = table.place(10, 64, 2).unwrap();
+        let a_dup = table.place(10, 64, 2).unwrap();
+        assert_eq!(a, a_dup);
+        let b = table.place(20, 128, 2).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(table.place(99, 0, 2), None);
+        assert_eq!(table.place(10, 66, 2), None);
     }
 }

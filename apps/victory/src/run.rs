@@ -68,6 +68,70 @@ fn resolve_startup_cache_options(
     }
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ThroughputEnv {
+    thin: bool,
+    join_parts: u32,
+    card_rehash_runs: bool,
+    join_barriers: bool,
+}
+
+#[cfg(any(windows, test))]
+fn resolve_throughput_defaults(
+    thin_env: Option<&str>,
+    join_parts_env: Option<&str>,
+    rehash_env: Option<&str>,
+    join_barriers_env: Option<&str>,
+    cores: usize,
+) -> ThroughputEnv {
+    let thin = parse_env_bool(thin_env, true);
+    let parsed_parts = join_parts_env
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&v| v >= 1);
+    let join_parts = if thin {
+        parsed_parts.unwrap_or_else(|| victory_core::TequestaConfig::default_join_parts(cores))
+    } else {
+        parsed_parts.unwrap_or(1)
+    };
+    ThroughputEnv {
+        thin,
+        join_parts,
+        card_rehash_runs: parse_env_bool(rehash_env, true),
+        join_barriers: parse_env_bool(join_barriers_env, true),
+    }
+}
+
+#[cfg(windows)]
+fn ensure_high_throughput_env() -> ThroughputEnv {
+    let env_opt = |name: &str| std::env::var(name).ok();
+    let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let resolved = resolve_throughput_defaults(
+        env_opt("VICTORY_THIN").as_deref(),
+        env_opt("VICTORY_JOIN_PARTS").as_deref(),
+        env_opt("VICTORY_CARD_REHASH_RUNS").as_deref(),
+        env_opt("VICTORY_JOIN_BARRIERS").as_deref(),
+        cores,
+    );
+    let set_if_unset = |name: &str, value: &str| {
+        if std::env::var_os(name).is_none() {
+            // SAFETY: called at startup on the main thread before spawning workers.
+            unsafe { std::env::set_var(name, value) };
+        }
+    };
+    set_if_unset("VICTORY_THIN", if resolved.thin { "1" } else { "0" });
+    set_if_unset("VICTORY_JOIN_PARTS", &resolved.join_parts.to_string());
+    set_if_unset(
+        "VICTORY_CARD_REHASH_RUNS",
+        if resolved.card_rehash_runs { "1" } else { "0" },
+    );
+    set_if_unset(
+        "VICTORY_JOIN_BARRIERS",
+        if resolved.join_barriers { "1" } else { "0" },
+    );
+    resolved
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -79,6 +143,15 @@ pub fn run(
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
+
+    let throughput = ensure_high_throughput_env();
+    println!(
+        "throughput     thin={} join_parts={} card_rehash={} join_barriers={}",
+        u8::from(throughput.thin),
+        throughput.join_parts,
+        u8::from(throughput.card_rehash_runs),
+        u8::from(throughput.join_barriers),
+    );
 
     if execute {
         check_cpu_features()?;
@@ -716,6 +789,48 @@ mod cpu_check_tests {
             StartupCacheOptions {
                 shader_prewarm: false,
                 pipeline_precache: false,
+            }
+        );
+    }
+
+    #[test]
+    fn throughput_defaults_apply_and_respect_overrides() {
+        use super::{ThroughputEnv, resolve_throughput_defaults};
+
+        assert_eq!(
+            resolve_throughput_defaults(None, None, None, None, 8),
+            ThroughputEnv {
+                thin: true,
+                join_parts: 8,
+                card_rehash_runs: true,
+                join_barriers: true,
+            }
+        );
+        assert_eq!(
+            resolve_throughput_defaults(None, None, None, None, 4),
+            ThroughputEnv {
+                thin: true,
+                join_parts: 4,
+                card_rehash_runs: true,
+                join_barriers: true,
+            }
+        );
+        assert_eq!(
+            resolve_throughput_defaults(Some("0"), Some("2"), Some("0"), Some("0"), 16),
+            ThroughputEnv {
+                thin: false,
+                join_parts: 2,
+                card_rehash_runs: false,
+                join_barriers: false,
+            }
+        );
+        assert_eq!(
+            resolve_throughput_defaults(Some("1"), Some("6"), None, None, 16),
+            ThroughputEnv {
+                thin: true,
+                join_parts: 6,
+                card_rehash_runs: true,
+                join_barriers: true,
             }
         );
     }

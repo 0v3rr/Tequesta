@@ -175,9 +175,60 @@ impl TequestaConfig {
         std::fs::write(Self::path(), body)
     }
 
+    /// Returns the recommended `VICTORY_JOIN_PARTS` worker/batch count for a
+    /// host with `logical_cores` logical CPUs.
+    pub fn default_join_parts(logical_cores: usize) -> u32 {
+        if logical_cores >= 8 {
+            8
+        } else if logical_cores >= 4 {
+            4
+        } else {
+            1
+        }
+    }
+
+    /// Resolves high-throughput environment defaults without clobbering
+    /// explicit environment variable overrides.
+    pub fn resolved_throughput_env(
+        &self,
+        thin_env: Option<&str>,
+        join_parts_env: Option<&str>,
+        rehash_env: Option<&str>,
+        join_barriers_env: Option<&str>,
+    ) -> [(&'static str, String); 4] {
+        let thin = thin_env.map_or_else(
+            || if self.thin_lists { "1".to_owned() } else { "0".to_owned() },
+            ToOwned::to_owned,
+        );
+        let join_parts = join_parts_env.map_or_else(
+            || self.join_parts.to_string(),
+            ToOwned::to_owned,
+        );
+        let rehash = rehash_env.map_or_else(
+            || if self.card_rehash_runs { "1".to_owned() } else { "0".to_owned() },
+            ToOwned::to_owned,
+        );
+        let join_barriers = join_barriers_env.map_or_else(
+            || "1".to_owned(),
+            ToOwned::to_owned,
+        );
+        [
+            ("VICTORY_THIN", thin),
+            ("VICTORY_JOIN_PARTS", join_parts),
+            ("VICTORY_CARD_REHASH_RUNS", rehash),
+            ("VICTORY_JOIN_BARRIERS", join_barriers),
+        ]
+    }
+
     /// Applies restart-scoped settings to the process environment at startup
     /// before subsystems initialize.
     pub fn apply_startup_env(&self) {
+        unsafe fn set_env_if_unset(name: &str, value: &str) {
+            if std::env::var_os(name).is_none() {
+                // SAFETY: called single-threaded at process startup before spawning workers.
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
         // SAFETY: called single-threaded at process startup before spawning workers.
         unsafe {
             std::env::set_var("VICTORY_PORT_STATIC", if self.port_static { "1" } else { "0" });
@@ -211,12 +262,13 @@ impl TequestaConfig {
                 "VICTORY_REFLECTION_GUARD",
                 if self.reflection_probe_guard { "1" } else { "0" },
             );
-            std::env::set_var("VICTORY_THIN", if self.thin_lists { "1" } else { "0" });
-            std::env::set_var("VICTORY_JOIN_PARTS", self.join_parts.to_string());
-            std::env::set_var(
+            set_env_if_unset("VICTORY_THIN", if self.thin_lists { "1" } else { "0" });
+            set_env_if_unset("VICTORY_JOIN_PARTS", &self.join_parts.to_string());
+            set_env_if_unset(
                 "VICTORY_CARD_REHASH_RUNS",
                 if self.card_rehash_runs { "1" } else { "0" },
             );
+            set_env_if_unset("VICTORY_JOIN_BARRIERS", "1");
             std::env::set_var(
                 "VICTORY_SHADER_PREWARM",
                 if self.shader_prewarm { "1" } else { "0" },
@@ -302,5 +354,33 @@ card_rehash_runs = true
         assert_eq!(parsed.fps_cap, 60);
         assert_eq!(parsed.resolution_scale, 75);
         assert_eq!(parsed.join_parts, 4);
+    }
+
+    #[test]
+    fn throughput_env_defaults_and_preserves_overrides() {
+        assert_eq!(TequestaConfig::default_join_parts(1), 1);
+        assert_eq!(TequestaConfig::default_join_parts(4), 4);
+        assert_eq!(TequestaConfig::default_join_parts(8), 8);
+        assert_eq!(TequestaConfig::default_join_parts(16), 8);
+
+        let cfg = TequestaConfig::default();
+        assert_eq!(
+            cfg.resolved_throughput_env(None, None, None, None),
+            [
+                ("VICTORY_THIN", "1".to_owned()),
+                ("VICTORY_JOIN_PARTS", "8".to_owned()),
+                ("VICTORY_CARD_REHASH_RUNS", "1".to_owned()),
+                ("VICTORY_JOIN_BARRIERS", "1".to_owned()),
+            ]
+        );
+        assert_eq!(
+            cfg.resolved_throughput_env(Some("0"), Some("4"), Some("0"), Some("0")),
+            [
+                ("VICTORY_THIN", "0".to_owned()),
+                ("VICTORY_JOIN_PARTS", "4".to_owned()),
+                ("VICTORY_CARD_REHASH_RUNS", "0".to_owned()),
+                ("VICTORY_JOIN_BARRIERS", "0".to_owned()),
+            ]
+        );
     }
 }

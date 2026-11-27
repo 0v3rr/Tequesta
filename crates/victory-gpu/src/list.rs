@@ -711,7 +711,7 @@ pub(crate) struct Barrier {
 }
 
 /// The barrier on host resources, or `None` if it names a resource the host
-/// GPU does not have (buffers so far).
+/// GPU does not have (buffers so far) or is already in the target state.
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
@@ -727,12 +727,16 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
             let (texture, before) = list.transition(b.first, wanted)?;
+            let after = crate::host::legal_state(texture, wanted);
+            if before == after {
+                return None;
+            }
             Some(Barrier {
                 kind: 0,
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(after),
             })
         }
         1 => Some(Barrier {
@@ -776,6 +780,70 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// Conservatively coalesces adjacent redundant/no-op barriers in `buf[..*len]` in place:
+/// - Drops no-op transitions (`before == after` when `flags == 0`).
+/// - Merges immediately adjacent transitions on the same resource/subresource (`A->B` + `B->C` => `A->C`)
+///   ONLY when `A != C` (never cancels `A->B->A` round-trips across passes).
+/// - Deduplicates immediately adjacent identical UAV or aliasing barriers without reordering.
+fn coalesce_barriers(buf: &mut [Barrier], len: &mut usize) {
+    let n = *len;
+    let mut write = 0usize;
+    for i in 0..n {
+        let b = buf[i];
+        match b.kind {
+            0 => {
+                let sub = b.second as u32;
+                let before = (b.second >> 32) as u32;
+                let after = b.last as u32;
+                if b.flags == 0 && before == after {
+                    continue;
+                }
+                if write > 0 {
+                    let prev = &mut buf[write - 1];
+                    if prev.kind == 0
+                        && prev.first == b.first
+                        && (prev.second as u32) == sub
+                        && prev.flags == 0
+                        && b.flags == 0
+                        && (prev.last as u32) == before
+                        && (prev.second >> 32) as u32 != after
+                    {
+                        prev.last = u64::from(after);
+                        continue;
+                    }
+                }
+                buf[write] = b;
+                write += 1;
+            }
+            1 => {
+                if write > 0 {
+                    let prev = buf[write - 1];
+                    if prev.kind == 1 && prev.first == b.first && prev.second == b.second {
+                        continue;
+                    }
+                }
+                buf[write] = b;
+                write += 1;
+            }
+            2 => {
+                if write > 0 {
+                    let prev = buf[write - 1];
+                    if prev.kind == 2 && (prev.first.is_null() || prev.first == b.first) {
+                        continue;
+                    }
+                }
+                buf[write] = b;
+                write += 1;
+            }
+            _ => {
+                buf[write] = b;
+                write += 1;
+            }
+        }
+    }
+    *len = write;
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -791,26 +859,55 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         if count > 0 {
             with_state(this, |l, state| state.synced_on(l, has_buffer_barrier));
         }
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        let mut stack = [UAV_BARRIER; 16];
+        let mut stack_len = 0usize;
+        let mut heap: Vec<Barrier> = Vec::new();
+        for b in barriers {
+            if let Some(hb) = host_barrier(list, b) {
+                if !heap.is_empty() {
+                    heap.push(hb);
+                } else if stack_len < stack.len() {
+                    stack[stack_len] = hb;
+                    stack_len += 1;
+                } else {
+                    heap.extend_from_slice(&stack[..stack_len]);
+                    heap.push(hb);
+                }
+            }
+        }
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if has_buffer_barrier {
-            host.push(UAV_BARRIER);
+            if !heap.is_empty() {
+                heap.push(UAV_BARRIER);
+            } else if stack_len < stack.len() {
+                stack[stack_len] = UAV_BARRIER;
+                stack_len += 1;
+            } else {
+                heap.extend_from_slice(&stack[..stack_len]);
+                heap.push(UAV_BARRIER);
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
-        if !host.is_empty() {
+        let slice: &[Barrier] = if !heap.is_empty() {
+            let mut n = heap.len();
+            coalesce_barriers(&mut heap, &mut n);
+            heap.truncate(n);
+            &heap
+        } else {
+            coalesce_barriers(&mut stack, &mut stack_len);
+            &stack[..stack_len]
+        };
+        if !slice.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
             // SAFETY: the same layout; borrowed resource pointers, never
             // released through this slice.
             let host = unsafe {
                 std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
+                    slice.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+                    slice.len(),
                 )
             };
             // SAFETY: an open list and live resources.
@@ -1405,7 +1502,7 @@ extern "system" fn clear_rtv(
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
+                list.list.barriers(&[crate::host::transition(
                     texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
@@ -2475,5 +2572,69 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn coalesce_barriers_merges_and_drops_redundant() {
+        let r1 = 0x1000usize as This;
+        let r2 = 0x2000usize as This;
+        let tr = |r: This, before: u32, after: u32| Barrier {
+            kind: 0,
+            flags: 0,
+            first: r,
+            second: 0xffff_ffff | (u64::from(before) << 32),
+            last: u64::from(after),
+        };
+        let uav = |r: This| Barrier {
+            kind: 2,
+            flags: 0,
+            first: r,
+            second: 0,
+            last: 0,
+        };
+        let alias = |a: This, b: This| Barrier {
+            kind: 1,
+            flags: 0,
+            first: a,
+            second: b as u64,
+            last: 0,
+        };
+
+        // No-op + adjacent chain + preserved round-trip + adjacent UAV/alias dedup.
+        let mut buf = [
+            tr(r1, 4, 4),          // no-op -> dropped
+            tr(r1, 0, 4),          // r1: 0 -> 4
+            tr(r1, 4, 8),          // adjacent merges -> r1: 0 -> 8
+            tr(r2, 1, 2),          // r2: 1 -> 2
+            tr(r2, 2, 1),          // round-trip -> preserved (never cancelled)
+            uav(r1),               // specific UAV
+            uav(r1),               // adjacent duplicate UAV -> dropped
+            uav(std::ptr::null()), // global UAV after specific UAV -> kept in order
+            uav(r2),               // adjacent UAV after global UAV -> dropped
+            alias(r1, r2),
+            alias(r1, r2),         // adjacent duplicate alias -> dropped
+        ];
+        let mut len = buf.len();
+        coalesce_barriers(&mut buf, &mut len);
+        assert_eq!(len, 6);
+        assert_eq!(buf[0].kind, 0);
+        assert_eq!(buf[0].first, r1);
+        assert_eq!((buf[0].second >> 32) as u32, 0);
+        assert_eq!(buf[0].last as u32, 8);
+        assert_eq!(buf[1].kind, 0);
+        assert_eq!(buf[1].first, r2);
+        assert_eq!((buf[1].second >> 32) as u32, 1);
+        assert_eq!(buf[1].last as u32, 2);
+        assert_eq!(buf[2].kind, 0);
+        assert_eq!(buf[2].first, r2);
+        assert_eq!((buf[2].second >> 32) as u32, 2);
+        assert_eq!(buf[2].last as u32, 1);
+        assert_eq!(buf[3].kind, 2);
+        assert_eq!(buf[3].first, r1);
+        assert_eq!(buf[4].kind, 2);
+        assert!(buf[4].first.is_null());
+        assert_eq!(buf[5].kind, 1);
+        assert_eq!(buf[5].first, r1);
+        assert_eq!(buf[5].second as This, r2);
     }
 }
