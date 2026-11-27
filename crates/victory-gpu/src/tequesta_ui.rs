@@ -1,12 +1,14 @@
 //! Native D3D12 `F1` overlay menu and compact top-right FPS/frametime HUD.
 //!
 //! - Toggle menu with `F1` (`VK_F1`).
-//! - Hot settings (apply immediately): `VICTORY_PORT_STATIC`, FPS cap
-//!   (`Unlimited` / `30` / `60`), mouse sensitivity (`0.25x..3.00x`), and
-//!   compact FPS/ms corner counter.
-//! - Restart-required settings (persisted to `tequesta_config.toml`):
-//!   resolution scale (`50%` / `75%` / `100%`), windowed vs borderless
-//!   fullscreen, `VICTORY_RAW_VIEWS`, and `VICTORY_KBM_NATIVE`.
+//! - Live settings (apply immediately): Display Mode (`Borderless` / `Windowed`),
+//!   Mouse Sensitivity (`0.25x..8.00x`), Frame Rate Cap (`Unlimited` / `30` / `60`),
+//!   Static Draw Cache, Ambient Indirect Light, Reflection & Probe Guard, and
+//!   Performance HUD.
+//! - Launch settings (persisted to `tequesta_config.toml`, applied on restart):
+//!   Resolution Scale (`50%` / `75%` / `100%`), Native Keyboard & Mouse,
+//!   Parallel Command Lists, Translation Workers (`1` / `4` / `8`), and
+//!   Direct GPU Views.
 //! - Action buttons: `APPLY & RESTART` and `QUIT GAME`.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
@@ -14,10 +16,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use victory_core::TequestaConfig;
-use windows::Win32::Foundation::{HWND, POINT as WIN_POINT};
+use windows::Win32::Foundation::{HWND, POINT as WIN_POINT, RECT as WIN_RECT};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_LBUTTON, VK_LEFT, VK_RETURN, VK_RIGHT,
@@ -30,26 +33,29 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::host::{Host, HostList, transition};
 
-const MENU_W: u32 = 520;
-const MENU_H: u32 = 444;
+/// Window message posted to toggle borderless/windowed mode live on the UI thread.
+pub const WM_APP_DISPLAY_MODE: u32 = 0x8000 + 0x54;
+
+const MENU_W: u32 = 760;
+const MENU_H: u32 = 660;
 const HUD_W: u32 = 176;
 const HUD_H: u32 = 30;
 const UPLOADS: usize = 4;
 
-const BG: [u8; 3] = [16, 18, 24];
-const HEADER_BG: [u8; 3] = [24, 28, 38];
-const BORDER: [u8; 3] = [66, 76, 98];
-const ROW_HL: [u8; 3] = [36, 48, 72];
-const BTN_RESTART: [u8; 3] = [36, 92, 168];
-const BTN_RESTART_HL: [u8; 3] = [54, 122, 214];
-const BTN_QUIT: [u8; 3] = [138, 38, 46];
-const BTN_QUIT_HL: [u8; 3] = [184, 52, 62];
-const WHITE: [u8; 3] = [240, 244, 250];
-const MUTED: [u8; 3] = [164, 174, 192];
-const ACCENT: [u8; 3] = [104, 180, 255];
-const GREEN: [u8; 3] = [124, 232, 92];
-const ORANGE: [u8; 3] = [245, 168, 66];
-const RED: [u8; 3] = [240, 82, 76];
+const BG: [u8; 3] = [15, 14, 24];
+const HEADER_BG: [u8; 3] = [24, 20, 36];
+const BORDER: [u8; 3] = [82, 66, 108];
+const ROW_HL: [u8; 3] = [44, 32, 62];
+const BTN_RESTART: [u8; 3] = [156, 52, 92];
+const BTN_RESTART_HL: [u8; 3] = [214, 72, 122];
+const BTN_QUIT: [u8; 3] = [92, 34, 52];
+const BTN_QUIT_HL: [u8; 3] = [148, 46, 68];
+const WHITE: [u8; 3] = [246, 244, 250];
+const MUTED: [u8; 3] = [172, 166, 194];
+const CORAL: [u8; 3] = [255, 102, 140];
+const AMBER: [u8; 3] = [255, 178, 84];
+const TEAL: [u8; 3] = [72, 224, 212];
+const RED: [u8; 3] = [245, 92, 96];
 
 static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 static FPS_CAP: OnceLock<AtomicU32> = OnceLock::new();
@@ -67,6 +73,8 @@ fn config_lock() -> &'static Mutex<TequestaConfig> {
         let _ = SHOW_HUD.set(AtomicBool::new(cfg.show_fps_hud));
         let _ = KBM_NATIVE.set(AtomicBool::new(cfg.kbm_native));
         crate::port_static::set_enabled(cfg.port_static);
+        crate::ambient::set_enabled(cfg.ambient_gi);
+        crate::ambient::set_probe_guard(cfg.reflection_probe_guard);
         Mutex::new(cfg)
     })
 }
@@ -139,6 +147,15 @@ fn notify_cursor(hwnd: HWND) {
         // SAFETY: asynchronous post to our own process's window.
         unsafe {
             let _ = PostMessageW(hwnd.0.cast(), WM_SETCURSOR, hwnd.0 as usize, lparam);
+        }
+    }
+}
+
+fn apply_display_mode(hwnd: HWND, borderless: bool) {
+    if !hwnd.0.is_null() {
+        // SAFETY: asynchronous post to our own process's window.
+        unsafe {
+            let _ = PostMessageW(hwnd.0.cast(), WM_APP_DISPLAY_MODE, usize::from(borderless), 0);
         }
     }
 }
@@ -427,85 +444,227 @@ impl Surface {
     }
 }
 
-const ROW_COUNT: usize = 10;
+const ROW_COUNT: usize = 16;
+const BTN_Y: u32 = 586;
+const BTN1_X: u32 = 24;
+const BTN1_W: u32 = 420;
+const BTN2_X: u32 = 464;
+const BTN2_W: u32 = 272;
 
 /// Row y-coordinates inside the `MENU_W x MENU_H` canvas.
 const fn row_y(idx: usize) -> u32 {
     match idx {
-        0 => 76,
-        1 => 106,
-        2 => 136,
-        3 => 166,
-        4 => 222,
-        5 => 252,
-        6 => 282,
-        7 => 312,
-        8 | 9 => 378,
+        0..=6 => 80 + (idx as u32) * 33,
+        7..=13 => 345 + ((idx - 7) as u32) * 33,
+        14 | 15 => BTN_Y,
         _ => 0,
     }
 }
 
-fn draw_menu_row(c: &mut Canvas, selected: usize, idx: usize, label: &str, val: &str, val_col: [u8; 3]) {
+fn draw_menu_row(
+    c: &mut Canvas,
+    selected: usize,
+    idx: usize,
+    label: &str,
+    desc: &str,
+    val: &str,
+    val_col: [u8; 3],
+) {
     let y = row_y(idx);
     if selected == idx {
-        c.rect(10, y - 3, MENU_W - 20, 24, ROW_HL);
-        c.text(16, y + 2, 2, ACCENT, ">");
+        c.rect(14, y - 2, MENU_W - 28, 31, ROW_HL);
+        c.rect(14, y - 2, 3, 31, CORAL);
+        c.text(24, y + 2, 2, CORAL, ">");
     }
-    c.text(34, y + 2, 2, WHITE, label);
-    let vx = MENU_W - 20 - (val.len() as u32 * 12);
+    c.text(44, y + 2, 2, WHITE, label);
+    c.text(44, y + 20, 1, MUTED, desc);
+    let vx = MENU_W - 26 - (val.len() as u32 * 12);
     c.text(vx, y + 2, 2, val_col, val);
+}
+
+fn paint_sunset_strip(c: &mut Canvas, y: u32, h: u32) {
+    let w = MENU_W.saturating_sub(2);
+    let mid = w / 2;
+    let lerp = |a: [u8; 3], b: [u8; 3], num: u32, den: u32| -> [u8; 3] {
+        [
+            ((u32::from(a[0]) * (den - num) + u32::from(b[0]) * num) / den) as u8,
+            ((u32::from(a[1]) * (den - num) + u32::from(b[1]) * num) / den) as u8,
+            ((u32::from(a[2]) * (den - num) + u32::from(b[2]) * num) / den) as u8,
+        ]
+    };
+    for x in 0..w {
+        let col = if x < mid {
+            lerp(CORAL, AMBER, x, mid.max(1))
+        } else {
+            lerp(AMBER, TEAL, x - mid, (w - mid).max(1))
+        };
+        c.rect(1 + x, y, 1, h, col);
+    }
 }
 
 fn paint_menu(cfg: &TequestaConfig, selected: usize, pending_restart: bool) -> Canvas {
     let mut c = Canvas::new(MENU_W, MENU_H, BG);
     c.border(0, 0, MENU_W, MENU_H, BORDER);
-    c.rect(1, 1, MENU_W - 2, 42, HEADER_BG);
-    c.text(16, 14, 2, ACCENT, "TEQUESTA MENU F1");
+    c.rect(1, 1, MENU_W - 2, 46, HEADER_BG);
+    paint_sunset_strip(&mut c, 1, 3);
+    c.text(24, 18, 2, CORAL, "TEQUESTA | GTA VI");
     let tag = if pending_restart { "RESTART REQUIRED" } else { "READY" };
-    let tag_col = if pending_restart { ORANGE } else { GREEN };
-    c.text(MENU_W - 14 - (tag.len() as u32 * 12), 16, 2, tag_col, tag);
+    let tag_col = if pending_restart { AMBER } else { TEAL };
+    c.text(MENU_W - 24 - (tag.len() as u32 * 12), 18, 2, tag_col, tag);
 
-    c.text(16, 54, 2, ACCENT, "LIVE SETTINGS");
-    draw_menu_row(&mut c, selected, 0, "VICTORY_PORT_STATIC", if cfg.port_static { "ON" } else { "OFF" }, if cfg.port_static { GREEN } else { RED });
+    c.text(24, 56, 2, AMBER, "LIVE SETTINGS");
+    c.rect(24, 73, 160, 1, BORDER);
+    draw_menu_row(
+        &mut c,
+        selected,
+        0,
+        "DISPLAY MODE",
+        "SWITCH BORDERLESS WINDOW AND WINDOWED MODE LIVE",
+        if cfg.borderless_fullscreen { "BORDERLESS" } else { "WINDOWED" },
+        TEAL,
+    );
+    let sens_str = format!("{:.2}X", cfg.mouse_sensitivity);
+    draw_menu_row(
+        &mut c,
+        selected,
+        1,
+        "MOUSE SENSITIVITY",
+        "CAMERA TURN GAIN FOR SMOOTH RAW MOUSE LOOK",
+        &sens_str,
+        WHITE,
+    );
     let fps_str = match cfg.fps_cap {
         30 => "30 FPS",
         60 => "60 FPS",
         _ => "UNLIMITED",
     };
-    draw_menu_row(&mut c, selected, 1, "FPS CAP", fps_str, ACCENT);
-    let sens_str = format!("{:.2}X", cfg.mouse_sensitivity);
-    draw_menu_row(&mut c, selected, 2, "MOUSE SENSITIVITY", &sens_str, WHITE);
-    draw_menu_row(&mut c, selected, 3, "FPS/MS COUNTER", if cfg.show_fps_hud { "ON" } else { "OFF" }, if cfg.show_fps_hud { GREEN } else { MUTED });
-
-    c.rect(14, 194, MENU_W - 28, 1, BORDER);
-    c.text(16, 200, 2, ORANGE, "RESTART REQUIRED");
-
-    let res_str = format!("{}%", cfg.resolution_scale);
-    draw_menu_row(&mut c, selected, 4, "RESOLUTION SCALE", &res_str, WHITE);
+    draw_menu_row(
+        &mut c,
+        selected,
+        2,
+        "FRAME RATE CAP",
+        "LIMIT OUTPUT FPS FOR STEADIER FRAME PACING",
+        fps_str,
+        AMBER,
+    );
+    draw_menu_row(
+        &mut c,
+        selected,
+        3,
+        "STATIC DRAW CACHE",
+        "CACHE REPEATED DRAW STATE AND DESCRIPTORS FOR FPS",
+        if cfg.port_static { "ON" } else { "OFF" },
+        if cfg.port_static { TEAL } else { RED },
+    );
+    draw_menu_row(
+        &mut c,
+        selected,
+        4,
+        "AMBIENT INDIRECT LIGHT",
+        "ESTIMATE INDOOR GLOBAL ILLUMINATION WITHOUT RT",
+        if cfg.ambient_gi { "ON" } else { "OFF" },
+        if cfg.ambient_gi { TEAL } else { RED },
+    );
     draw_menu_row(
         &mut c,
         selected,
         5,
-        "DISPLAY MODE",
-        if cfg.borderless_fullscreen { "BORDERLESS" } else { "WINDOWED" },
+        "REFLECTION & PROBE GUARD",
+        "SOFTEN VOLUMETRIC FOG AND STALE PROBE FLASHES",
+        if cfg.reflection_probe_guard { "ON" } else { "OFF" },
+        if cfg.reflection_probe_guard { TEAL } else { MUTED },
+    );
+    draw_menu_row(
+        &mut c,
+        selected,
+        6,
+        "PERFORMANCE HUD",
+        "SHOW COMPACT FPS AND FRAMETIME IN TOP-RIGHT",
+        if cfg.show_fps_hud { "ON" } else { "OFF" },
+        if cfg.show_fps_hud { TEAL } else { MUTED },
+    );
+
+    c.rect(20, 315, MENU_W - 40, 1, BORDER);
+    c.text(24, 323, 2, CORAL, "LAUNCH SETTINGS - RESTART REQUIRED");
+
+    let res_str = format!("{}%", cfg.resolution_scale);
+    draw_menu_row(
+        &mut c,
+        selected,
+        7,
+        "RESOLUTION SCALE",
+        "INTERNAL DISPLAY RESOLUTION SCALE OF 1080P",
+        &res_str,
         WHITE,
     );
-    draw_menu_row(&mut c, selected, 6, "VICTORY_RAW_VIEWS", if cfg.raw_views { "ON" } else { "OFF" }, if cfg.raw_views { GREEN } else { MUTED });
-    draw_menu_row(&mut c, selected, 7, "NATIVE KEYBOARD/MOUSE", if cfg.kbm_native { "ON" } else { "OFF" }, if cfg.kbm_native { GREEN } else { RED });
+    draw_menu_row(
+        &mut c,
+        selected,
+        8,
+        "NATIVE KEYBOARD & MOUSE",
+        "ENABLE RAW MOUSE LOOK AND AZERTY/QWERTY SCANCODES",
+        if cfg.kbm_native { "ON" } else { "OFF" },
+        if cfg.kbm_native { TEAL } else { RED },
+    );
+    draw_menu_row(
+        &mut c,
+        selected,
+        9,
+        "SHADER PRELOAD",
+        "PRECOMPILE SHADERS AT LAUNCH TO CUT STUTTER",
+        if cfg.shader_prewarm { "ON" } else { "OFF" },
+        if cfg.shader_prewarm { TEAL } else { MUTED },
+    );
+    draw_menu_row(
+        &mut c,
+        selected,
+        10,
+        "PIPELINE CACHE",
+        "CACHE COMPILED D3D12 PIPELINES ON DISK",
+        if cfg.pipeline_precache { "ON" } else { "OFF" },
+        if cfg.pipeline_precache { TEAL } else { MUTED },
+    );
+    draw_menu_row(
+        &mut c,
+        selected,
+        11,
+        "PARALLEL COMMAND LISTS",
+        "TRANSLATE COMMAND LISTS ACROSS CPU WORKER THREADS",
+        if cfg.thin_lists { "ON" } else { "OFF" },
+        if cfg.thin_lists { TEAL } else { MUTED },
+    );
+    let workers_str = format!("{}", cfg.join_parts);
+    draw_menu_row(
+        &mut c,
+        selected,
+        12,
+        "TRANSLATION WORKERS",
+        "CPU WORKER COUNT FOR GPU COMMAND TRANSLATION",
+        &workers_str,
+        AMBER,
+    );
+    draw_menu_row(
+        &mut c,
+        selected,
+        13,
+        "DIRECT GPU VIEWS",
+        "DISABLE ARENA POOLING - KEEP OFF ON NVIDIA GPUS",
+        if cfg.raw_views { "ON" } else { "OFF" },
+        if cfg.raw_views { AMBER } else { MUTED },
+    );
 
     // Bottom action buttons.
-    let y_btn = row_y(8);
-    let (bx1, bw1) = (18u32, 286u32);
-    c.rect(bx1, y_btn, bw1, 32, if selected == 8 { BTN_RESTART_HL } else { BTN_RESTART });
-    c.border(bx1, y_btn, bw1, 32, BORDER);
-    c.text(bx1 + 53, y_btn + 9, 2, WHITE, "APPLY & RESTART");
+    c.rect(BTN1_X, BTN_Y, BTN1_W, 36, if selected == 14 { BTN_RESTART_HL } else { BTN_RESTART });
+    c.border(BTN1_X, BTN_Y, BTN1_W, 36, if selected == 14 { CORAL } else { BORDER });
+    c.text(BTN1_X + 120, BTN_Y + 11, 2, WHITE, "APPLY & RESTART");
 
-    let (bx2, bw2) = (318u32, 184u32);
-    c.rect(bx2, y_btn, bw2, 32, if selected == 9 { BTN_QUIT_HL } else { BTN_QUIT });
-    c.border(bx2, y_btn, bw2, 32, BORDER);
-    c.text(bx2 + 38, y_btn + 9, 2, WHITE, "QUIT GAME");
+    c.rect(BTN2_X, BTN_Y, BTN2_W, 36, if selected == 15 { BTN_QUIT_HL } else { BTN_QUIT });
+    c.border(BTN2_X, BTN_Y, BTN2_W, 36, if selected == 15 { CORAL } else { BORDER });
+    c.text(BTN2_X + 82, BTN_Y + 11, 2, WHITE, "QUIT GAME");
 
-    c.text(16, MENU_H - 22, 1, MUTED, "F1:CLOSE  UP/DOWN:SELECT  LEFT/RIGHT/ENTER:CHANGE");
+    let hint = "F1: CLOSE     UP/DOWN: SELECT     LEFT/RIGHT/ENTER: CHANGE";
+    let hint_x = MENU_W.saturating_sub(hint.len() as u32 * 6) / 2;
+    c.text(hint_x, MENU_H - 22, 1, MUTED, hint);
     c
 }
 
@@ -513,11 +672,11 @@ fn paint_hud(fps: f32, frame_ms: f32) -> Canvas {
     let mut c = Canvas::new(HUD_W, HUD_H, BG);
     c.border(0, 0, HUD_W, HUD_H, BORDER);
     let col = if fps >= 25.0 {
-        GREEN
+        TEAL
     } else if fps >= 12.0 {
-        ORANGE
+        AMBER
     } else {
-        RED
+        CORAL
     };
     let text = format!("{fps:4.1} FPS {frame_ms:4.0}MS");
     c.text(10, 8, 2, col, &text);
@@ -563,19 +722,33 @@ impl TequestaOverlay {
         }
     }
 
-    fn apply_row(&mut self, row: usize, dir: i32) {
+    fn apply_row(&mut self, hwnd: HWND, row: usize, dir: i32) {
         let mut restart_now = false;
         let mut quit_now = false;
+        let mut live_borderless = None;
         {
             let mut cfg = config_lock().lock().unwrap_or_else(|e| e.into_inner());
-            let mut hot_changed = false;
+            let mut changed = false;
             match row {
                 0 => {
-                    cfg.port_static = !cfg.port_static;
-                    crate::port_static::set_enabled(cfg.port_static);
-                    hot_changed = true;
+                    cfg.borderless_fullscreen = !cfg.borderless_fullscreen;
+                    live_borderless = Some(cfg.borderless_fullscreen);
+                    changed = true;
                 }
                 1 => {
+                    let step = if cfg.mouse_sensitivity >= 3.0 && (dir > 0 || cfg.mouse_sensitivity > 3.0) {
+                        0.50
+                    } else {
+                        0.25
+                    };
+                    let delta = if dir < 0 { -step } else { step };
+                    cfg.mouse_sensitivity = (cfg.mouse_sensitivity + delta).clamp(0.25, 8.0);
+                    if let Some(a) = MOUSE_SENS_X100.get() {
+                        a.store((cfg.mouse_sensitivity * 100.0).round() as u32, Relaxed);
+                    }
+                    changed = true;
+                }
+                2 => {
                     let order = [0u32, 30, 60];
                     let pos = order.iter().position(|&v| v == cfg.fps_cap).unwrap_or(0);
                     let next = if dir < 0 { (pos + 2) % 3 } else { (pos + 1) % 3 };
@@ -583,57 +756,89 @@ impl TequestaOverlay {
                     if let Some(a) = FPS_CAP.get() {
                         a.store(cfg.fps_cap, Relaxed);
                     }
-                    hot_changed = true;
-                }
-                2 => {
-                    let delta = if dir < 0 { -0.25 } else { 0.25 };
-                    cfg.mouse_sensitivity = (cfg.mouse_sensitivity + delta).clamp(0.25, 3.0);
-                    if let Some(a) = MOUSE_SENS_X100.get() {
-                        a.store((cfg.mouse_sensitivity * 100.0).round() as u32, Relaxed);
-                    }
-                    hot_changed = true;
+                    changed = true;
                 }
                 3 => {
+                    cfg.port_static = !cfg.port_static;
+                    crate::port_static::set_enabled(cfg.port_static);
+                    changed = true;
+                }
+                4 => {
+                    cfg.ambient_gi = !cfg.ambient_gi;
+                    crate::ambient::set_enabled(cfg.ambient_gi);
+                    changed = true;
+                }
+                5 => {
+                    cfg.reflection_probe_guard = !cfg.reflection_probe_guard;
+                    crate::ambient::set_probe_guard(cfg.reflection_probe_guard);
+                    changed = true;
+                }
+                6 => {
                     cfg.show_fps_hud = !cfg.show_fps_hud;
                     if let Some(a) = SHOW_HUD.get() {
                         a.store(cfg.show_fps_hud, Relaxed);
                     }
-                    hot_changed = true;
+                    changed = true;
                 }
-                4 => {
+                7 => {
                     let order = [50u32, 75, 100];
                     let pos = order.iter().position(|&v| v == cfg.resolution_scale).unwrap_or(2);
                     let next = if dir < 0 { (pos + 2) % 3 } else { (pos + 1) % 3 };
                     cfg.resolution_scale = order[next];
                     self.pending_restart = true;
+                    changed = true;
                 }
-                5 => {
-                    cfg.borderless_fullscreen = !cfg.borderless_fullscreen;
-                    self.pending_restart = true;
-                }
-                6 => {
-                    cfg.raw_views = !cfg.raw_views;
-                    self.pending_restart = true;
-                }
-                7 => {
+                8 => {
                     cfg.kbm_native = !cfg.kbm_native;
                     if let Some(a) = KBM_NATIVE.get() {
                         a.store(cfg.kbm_native, Relaxed);
                     }
                     self.pending_restart = true;
+                    changed = true;
                 }
-                8 => {
+                9 => {
+                    cfg.shader_prewarm = !cfg.shader_prewarm;
+                    self.pending_restart = true;
+                    changed = true;
+                }
+                10 => {
+                    cfg.pipeline_precache = !cfg.pipeline_precache;
+                    self.pending_restart = true;
+                    changed = true;
+                }
+                11 => {
+                    cfg.thin_lists = !cfg.thin_lists;
+                    self.pending_restart = true;
+                    changed = true;
+                }
+                12 => {
+                    let order = [1u32, 4, 8];
+                    let pos = order.iter().position(|&v| v == cfg.join_parts).unwrap_or(2);
+                    let next = if dir < 0 { (pos + 2) % 3 } else { (pos + 1) % 3 };
+                    cfg.join_parts = order[next];
+                    self.pending_restart = true;
+                    changed = true;
+                }
+                13 => {
+                    cfg.raw_views = !cfg.raw_views;
+                    self.pending_restart = true;
+                    changed = true;
+                }
+                14 => {
                     let _ = cfg.save();
                     restart_now = true;
                 }
-                9 => {
+                15 => {
                     quit_now = true;
                 }
                 _ => {}
             }
-            if hot_changed {
+            if changed {
                 let _ = cfg.save();
             }
+        }
+        if let Some(borderless) = live_borderless {
+            apply_display_mode(hwnd, borderless);
         }
         self.dirty_menu = true;
         if let Some((on_restart, on_quit)) = ACTIONS.get() {
@@ -685,16 +890,16 @@ impl TequestaOverlay {
             self.dirty_menu = true;
         }
         if edge(VK_LEFT, &mut self.left_was) {
-            self.apply_row(self.selected, -1);
+            self.apply_row(hwnd, self.selected, -1);
         }
         if edge(VK_RIGHT, &mut self.right_was) {
-            self.apply_row(self.selected, 1);
+            self.apply_row(hwnd, self.selected, 1);
         }
         if edge(VK_RETURN, &mut self.enter_was) || (ours && key_down(VK_SPACE)) {
-            self.apply_row(self.selected, 1);
+            self.apply_row(hwnd, self.selected, 1);
         }
 
-        // Mouse hover & click inside centered menu box.
+        // Mouse hover & click inside centered menu box (scaled to swapchain size).
         let lmb = ours && key_down(VK_LBUTTON);
         let clicked = lmb && !self.lmb_was;
         self.lmb_was = lmb;
@@ -703,27 +908,32 @@ impl TequestaOverlay {
             // SAFETY: valid POINT and HWND belonging to our process.
             if unsafe { GetCursorPos(&mut pt) } != 0 {
                 let mut wpt = WIN_POINT { x: pt.x, y: pt.y };
-                // SAFETY: valid POINT and HWND belonging to our process.
-                if unsafe { ScreenToClient(hwnd, &mut wpt) }.as_bool() {
+                let mut client = WIN_RECT::default();
+                // SAFETY: valid POINT, RECT, and HWND belonging to our process.
+                if unsafe { ScreenToClient(hwnd, &mut wpt).as_bool() && GetClientRect(hwnd, &mut client).is_ok() } {
+                    let cw = (client.right - client.left).max(1);
+                    let ch = (client.bottom - client.top).max(1);
+                    let sx = (wpt.x * width as i32) / cw;
+                    let sy = (wpt.y * height as i32) / ch;
                     let mx = width.saturating_sub(MENU_W) / 2;
                     let my = height.saturating_sub(MENU_H) / 2;
-                    let lx = wpt.x - mx as i32;
-                    let ly = wpt.y - my as i32;
+                    let lx = sx - mx as i32;
+                    let ly = sy - my as i32;
                     if (0..MENU_W as i32).contains(&lx) && (0..MENU_H as i32).contains(&ly) {
                         let mut hit: Option<usize> = None;
-                        for r in 0..8usize {
-                            let y0 = row_y(r) as i32 - 3;
-                            if (y0..y0 + 24).contains(&ly) {
+                        for r in 0..14usize {
+                            let y0 = row_y(r) as i32 - 2;
+                            if (y0..y0 + 31).contains(&ly) {
                                 hit = Some(r);
                                 break;
                             }
                         }
-                        let yb = row_y(8) as i32;
-                        if (yb..yb + 32).contains(&ly) {
-                            if (18..18 + 286).contains(&lx) {
-                                hit = Some(8);
-                            } else if (318..318 + 184).contains(&lx) {
-                                hit = Some(9);
+                        let yb = BTN_Y as i32;
+                        if (yb..yb + 36).contains(&ly) {
+                            if (BTN1_X as i32..(BTN1_X + BTN1_W) as i32).contains(&lx) {
+                                hit = Some(14);
+                            } else if (BTN2_X as i32..(BTN2_X + BTN2_W) as i32).contains(&lx) {
+                                hit = Some(15);
                             }
                         }
                         if let Some(r) = hit {
@@ -732,8 +942,12 @@ impl TequestaOverlay {
                                 self.dirty_menu = true;
                             }
                             if clicked {
-                                let dir = if lx < (MENU_W as i32) / 2 && r == 2 { -1 } else { 1 };
-                                self.apply_row(r, dir);
+                                let dir = if lx < (MENU_W as i32) / 2 && (r == 1 || r == 2 || r == 7 || r == 12) {
+                                    -1
+                                } else {
+                                    1
+                                };
+                                self.apply_row(hwnd, r, dir);
                             }
                         }
                     }
@@ -799,15 +1013,32 @@ mod tests {
 
     #[test]
     fn menu_and_hud_paint_cleanly() {
+        assert_eq!(ROW_COUNT, 16);
+        for r in 0..14 {
+            let y0 = row_y(r);
+            assert!(y0 + 31 <= BTN_Y, "row {r} overlaps buttons: {y0}");
+            if r + 1 < 14 {
+                let next_y0 = row_y(r + 1);
+                assert!(y0 + 31 <= next_y0, "row {r} overlaps row {}", r + 1);
+            }
+        }
+        assert!(BTN_Y + 36 <= MENU_H - 22, "buttons overlap footer hint");
+
         let mut cfg = TequestaConfig::default();
+        assert!(cfg.shader_prewarm);
+        assert!(cfg.pipeline_precache);
         let menu = paint_menu(&cfg, 0, false);
         assert_eq!(menu.rgb.len(), (MENU_W * MENU_H) as usize);
         let pitch = (MENU_W as usize * 4).next_multiple_of(256);
         assert_eq!(menu.pack(DXGI_FORMAT_R8G8B8A8_UNORM, pitch).len(), pitch * MENU_H as usize);
 
         cfg.borderless_fullscreen = true;
-        let menu_restart = paint_menu(&cfg, 8, true);
-        assert_eq!(menu_restart.rgb.len(), (MENU_W * MENU_H) as usize);
+        cfg.shader_prewarm = false;
+        cfg.pipeline_precache = false;
+        for row in 0..ROW_COUNT {
+            let m = paint_menu(&cfg, row, row >= 7);
+            assert_eq!(m.rgb.len(), (MENU_W * MENU_H) as usize);
+        }
 
         let hud = paint_hud(24.5, 40.8);
         assert_eq!(hud.rgb.len(), (HUD_W * HUD_H) as usize);

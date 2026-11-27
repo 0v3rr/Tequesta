@@ -126,6 +126,15 @@ static RAW_MOUSE_DX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32
 static RAW_MOUSE_DY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 #[cfg(windows)]
 static RAW_MOUSE_LAST_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(windows)]
+static RAW_PUMP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Returns true when the input poll thread's dedicated `RIDEV_INPUTSINK` raw
+/// mouse pump is active so `lifecycle::window_proc` does not double-count.
+#[cfg(windows)]
+pub(crate) fn raw_pump_active() -> bool {
+    RAW_PUMP_ACTIVE.load(Ordering::Relaxed)
+}
 
 /// Accumulates relative mouse deltas from `WM_INPUT` (Raw Input) while mouse-look
 /// is locked and the `F1` overlay menu is closed.
@@ -215,11 +224,13 @@ fn mouse_invert_y() -> bool {
     *INVERT
 }
 
-/// Exponentially smoothed mouse-delta to right-stick velocity converter.
+/// Continuous rate-normalized mouse-delta to right-stick velocity converter.
 ///
-/// The poll loop runs at 125 Hz (8 ms) while 3D gameplay may render at low
-/// framerates (~5 FPS). A 45 ms half-life keeps flicks alive long enough for
-/// the next rendered frame to sample them while settling cleanly to zero.
+/// Converts per-poll mouse deltas into a velocity rate (`counts / sec`),
+/// applies an asymmetric EMA (`ATTACK_TAU` rise, `RELEASE_TAU` release) so
+/// slow/continuous pans never stutter step-by-step and flicks bridge 15–27 FPS
+/// frames smoothly, then maps magnitude through a $C^1$ smoothstep
+/// anti-deadzone ramp.
 #[cfg(any(windows, test))]
 #[derive(Default)]
 struct MouseLook {
@@ -229,9 +240,11 @@ struct MouseLook {
 
 #[cfg(any(windows, test))]
 impl MouseLook {
-    const BASE_SENS: f32 = 0.022;
-    const HALF_LIFE_SECS: f32 = 0.045;
-    const DEADZONE: f32 = 0.015;
+    const COUNTS_FOR_FULL: f32 = 950.0;
+    const ATTACK_TAU: f32 = 0.036;
+    const RELEASE_TAU: f32 = 0.055;
+    const REST_EPS: f32 = 0.008;
+    const ANTI_DEADZONE: f32 = 0.14;
 
     fn reset(&mut self) {
         self.vx = 0.0;
@@ -240,20 +253,47 @@ impl MouseLook {
 
     fn step(&mut self, dx: i32, dy: i32, dt: Duration, sens: f32, invert_y: bool) -> (f32, f32) {
         let dt_secs = dt.as_secs_f32().clamp(0.001, 0.25);
-        let decay = 0.5_f32.powf(dt_secs / Self::HALF_LIFE_SECS);
-        let scale = Self::BASE_SENS * sens;
         let y_sign = if invert_y { 1.0 } else { -1.0 };
-        self.vx = (self.vx * decay + dx as f32 * scale).clamp(-1.0, 1.0);
-        self.vy = (self.vy * decay + dy as f32 * scale * y_sign).clamp(-1.0, 1.0);
-        // Only snap tiny residual decay to zero at rest so low-sensitivity
-        // 1-pixel movements are never dropped.
-        if dx == 0 && self.vx.abs() < Self::DEADZONE {
+        let gain = sens.max(0.05) / (Self::COUNTS_FOR_FULL * dt_secs);
+        let mut target_x = dx as f32 * gain;
+        let mut target_y = dy as f32 * gain * y_sign;
+        let target_mag = (target_x * target_x + target_y * target_y).sqrt();
+        if target_mag > 1.0 {
+            target_x /= target_mag;
+            target_y /= target_mag;
+        }
+        let tau_x = if target_x.abs() > self.vx.abs() {
+            Self::ATTACK_TAU
+        } else {
+            Self::RELEASE_TAU
+        };
+        let tau_y = if target_y.abs() > self.vy.abs() {
+            Self::ATTACK_TAU
+        } else {
+            Self::RELEASE_TAU
+        };
+        let alpha_x = 1.0 - (-dt_secs / tau_x).exp();
+        let alpha_y = 1.0 - (-dt_secs / tau_y).exp();
+        self.vx = (self.vx + (target_x - self.vx) * alpha_x).clamp(-1.0, 1.0);
+        self.vy = (self.vy + (target_y - self.vy) * alpha_y).clamp(-1.0, 1.0);
+
+        if dx == 0 && self.vx.abs() < Self::REST_EPS {
             self.vx = 0.0;
         }
-        if dy == 0 && self.vy.abs() < Self::DEADZONE {
+        if dy == 0 && self.vy.abs() < Self::REST_EPS {
             self.vy = 0.0;
         }
-        (self.vx, self.vy)
+        let mag = (self.vx * self.vx + self.vy * self.vy).sqrt().min(1.0);
+        if mag <= 1e-4 {
+            return (0.0, 0.0);
+        }
+        let u = (mag / 0.22).min(1.0);
+        let ramp = u * u * (3.0 - 2.0 * u);
+        let boosted = (mag + Self::ANTI_DEADZONE * ramp * (1.0 - mag)).min(1.0);
+        (
+            (self.vx / mag * boosted).clamp(-1.0, 1.0),
+            (self.vy / mag * boosted).clamp(-1.0, 1.0),
+        )
     }
 }
 
@@ -1481,9 +1521,154 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        ClipCursor, GetCursorPos, GetForegroundWindow, GetWindowInfo, GetWindowThreadProcessId,
-        HTCLIENT, PostMessageW, SetCursorPos, WINDOWINFO, WM_MOUSEMOVE, WM_SETCURSOR,
+        ClipCursor, CreateWindowExW, GetCursorPos, GetForegroundWindow, GetWindowInfo,
+        GetWindowThreadProcessId, HTCLIENT, HWND_MESSAGE, MSG, PM_REMOVE, PeekMessageW,
+        PostMessageW, SetCursorPos, WINDOWINFO, WM_MOUSEMOVE, WM_SETCURSOR,
     };
+    use windows_sys::core::w;
+
+    const WM_INPUT: u32 = 0x00FF;
+    const RID_INPUT: u32 = 0x1000_0003;
+    const RIM_TYPEMOUSE: u32 = 0;
+    const MOUSE_MOVE_ABSOLUTE: u16 = 1;
+    const RIDEV_INPUTSINK: u32 = 0x0000_0100;
+
+    #[repr(C)]
+    struct RawInputDevice {
+        us_usage_page: u16,
+        us_usage: u16,
+        dw_flags: u32,
+        hwnd_target: HWND,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawInputHeader {
+        dw_type: u32,
+        dw_size: u32,
+        h_device: isize,
+        w_param: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawMouse {
+        us_flags: u16,
+        _pad: u16,
+        ul_buttons: u32,
+        ul_raw_buttons: u32,
+        l_last_x: i32,
+        l_last_y: i32,
+        ul_extra_information: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawInputMousePacket {
+        header: RawInputHeader,
+        mouse: RawMouse,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn RegisterRawInputDevices(devices: *const RawInputDevice, num_devices: u32, size: u32) -> i32;
+        fn GetRawInputData(
+            h_raw_input: isize,
+            ui_command: u32,
+            p_data: *mut c_void,
+            pcb_size: *mut u32,
+            cb_size_header: u32,
+        ) -> u32;
+    }
+
+    #[derive(Default)]
+    struct RawMousePump {
+        init_attempted: bool,
+        hwnd: HWND,
+    }
+
+    // SAFETY: `RawMousePump` is only touched by `Host` behind `Hub::source` mutex
+    // on the poll thread, and `hwnd` is a process-local message-only window handle.
+    unsafe impl Send for RawMousePump {}
+
+    impl RawMousePump {
+        fn ensure_init(&mut self) {
+            if self.init_attempted {
+                return;
+            }
+            self.init_attempted = true;
+            // SAFETY: creates a lightweight message-only window on this poll thread
+            // and registers `RIDEV_INPUTSINK` mouse raw input so deltas arrive at 125 Hz
+            // regardless of the game's render FPS.
+            unsafe {
+                let hwnd = CreateWindowExW(
+                    0,
+                    w!("STATIC"),
+                    w!(""),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    HWND_MESSAGE,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if hwnd.is_null() {
+                    return;
+                }
+                let rid = RawInputDevice {
+                    us_usage_page: 0x01,
+                    us_usage: 0x02,
+                    dw_flags: RIDEV_INPUTSINK,
+                    hwnd_target: hwnd,
+                };
+                if RegisterRawInputDevices(&rid, 1, size_of::<RawInputDevice>() as u32) != 0 {
+                    self.hwnd = hwnd;
+                    RAW_PUMP_ACTIVE.store(true, Ordering::Release);
+                    tracing::info!("raw mouse input pump active (125 Hz RIDEV_INPUTSINK)");
+                }
+            }
+        }
+
+        fn drain(&mut self) -> (i32, i32, bool, bool) {
+            self.ensure_init();
+            if self.hwnd.is_null() {
+                return (0, 0, false, false);
+            }
+            let (mut dx, mut dy) = (0i32, 0i32);
+            let (mut saw_rel, mut saw_abs) = (false, false);
+            let mut msg = MSG::default();
+            // SAFETY: drains queued `WM_INPUT` messages for our message-only window.
+            unsafe {
+                while PeekMessageW(&mut msg, self.hwnd, WM_INPUT, WM_INPUT, PM_REMOVE) != 0 {
+                    let mut buf = [0u8; 64];
+                    let mut size = buf.len() as u32;
+                    let read = GetRawInputData(
+                        msg.lParam,
+                        RID_INPUT,
+                        buf.as_mut_ptr().cast(),
+                        &mut size,
+                        size_of::<RawInputHeader>() as u32,
+                    );
+                    if read != u32::MAX && (read as usize) >= size_of::<RawInputMousePacket>() {
+                        let pkt = buf.as_ptr().cast::<RawInputMousePacket>().read_unaligned();
+                        if pkt.header.dw_type == RIM_TYPEMOUSE {
+                            if (pkt.mouse.us_flags & MOUSE_MOVE_ABSOLUTE) == 0 {
+                                saw_rel = true;
+                                dx = dx.saturating_add(pkt.mouse.l_last_x);
+                                dy = dy.saturating_add(pkt.mouse.l_last_y);
+                            } else {
+                                saw_abs = true;
+                            }
+                        }
+                    }
+                }
+            }
+            (dx, dy, saw_rel, saw_abs)
+        }
+    }
 
     use super::*;
 
@@ -1528,6 +1713,8 @@ mod host {
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
         capture: MouseCapture,
+        raw_pump: RawMousePump,
+        raw_mode: bool,
         cursor_clipped: bool,
         clipped_rect: Option<(i32, i32, i32, i32)>,
         anchor: (i32, i32),
@@ -1675,6 +1862,14 @@ mod host {
         }
 
         fn mouse_pad(&mut self, active: bool) -> PadState {
+            // Always drain the raw input pump so stale deltas never queue up while unlocked.
+            let (pump_dx, pump_dy, saw_rel, saw_abs) = self.raw_pump.drain();
+            if saw_rel {
+                self.raw_mode = true;
+            } else if saw_abs {
+                self.raw_mode = false;
+            }
+
             let key_down = |vk: i32| {
                 // SAFETY: plain async key state query.
                 unsafe { GetAsyncKeyState(vk) < 0 }
@@ -1724,21 +1919,29 @@ mod host {
                 self.set_cursor_clip(Some((c_left, c_top, c_right, c_bottom)));
                 let cx = c_left + (c_right - c_left) / 2;
                 let cy = c_top + (c_bottom - c_top) / 2;
-                let (rdx, rdy) = (
+                let (fallback_dx, fallback_dy) = (
                     RAW_MOUSE_DX.swap(0, Ordering::Relaxed),
                     RAW_MOUSE_DY.swap(0, Ordering::Relaxed),
                 );
-                let use_raw = native_kbm() && (rdx != 0 || rdy != 0 || raw_mouse_recent(now()));
+                let (rdx, rdy) = if raw_pump_active() {
+                    (pump_dx, pump_dy)
+                } else {
+                    if fallback_dx != 0 || fallback_dy != 0 || raw_mouse_recent(now()) {
+                        self.raw_mode = true;
+                    }
+                    (fallback_dx, fallback_dy)
+                };
+                let use_raw = native_kbm() && self.raw_mode;
                 let (dx, dy) = if just_locked {
                     self.anchor = recenter_cursor(cx, cy).unwrap_or((pos.x, pos.y));
                     self.mouse_look.reset();
                     (0, 0)
                 } else if use_raw {
-                    // Keep cursor inside client area without FPS-coupled jitter.
-                    if pos.x <= c_left + 32
-                        || pos.x >= c_right - 32
-                        || pos.y <= c_top + 32
-                        || pos.y >= c_bottom - 32
+                    // Never feed cursor deltas in raw mode; recenter only near edges.
+                    if pos.x <= c_left + 48
+                        || pos.x >= c_right - 48
+                        || pos.y <= c_top + 48
+                        || pos.y >= c_bottom - 48
                     {
                         self.anchor = recenter_cursor(cx, cy).unwrap_or((pos.x, pos.y));
                     } else {
@@ -1748,9 +1951,14 @@ mod host {
                 } else {
                     let dx = pos.x - self.anchor.0;
                     let dy = pos.y - self.anchor.1;
+                    let max_step = ((c_right - c_left) / 3).max(160);
                     if dx != 0 || dy != 0 {
                         self.anchor = recenter_cursor(cx, cy).unwrap_or((pos.x, pos.y));
-                        (dx, dy)
+                        if dx.abs() > max_step || dy.abs() > max_step {
+                            (0, 0)
+                        } else {
+                            (dx, dy)
+                        }
                     } else {
                         (0, 0)
                     }
@@ -2376,7 +2584,10 @@ mod tests {
         release(r);
 
         let mut look = MouseLook::default();
-        let (rx, ry) = look.step(20, -10, POLL, 1.0, false);
+        let (mut rx, mut ry) = (0.0, 0.0);
+        for _ in 0..4 {
+            (rx, ry) = look.step(12, -6, POLL, 1.0, false);
+        }
         assert!(
             (0.3..=1.0).contains(&rx),
             "mouse right should push +right_x, got {rx}"
@@ -2395,11 +2606,25 @@ mod tests {
         }
         assert_eq!(look.step(0, 0, POLL, 1.0, false), (0.0, 0.0));
         // Low-sensitivity 1-pixel movement is not swallowed by the rest deadzone.
-        let (fine_x, _) = look.step(1, 0, POLL, 0.3, false);
+        let (fine_x, _) = look.step(1, 0, POLL, 0.5, false);
         assert!(
             fine_x > 0.0,
             "1px low-sens motion should stay non-zero, got {fine_x}"
         );
+        // A short mouse stroke clears console right-stick deadzone and settles quickly.
+        look.reset();
+        let (mut stroke_x, _) = (0.0, 0.0);
+        for _ in 0..3 {
+            (stroke_x, _) = look.step(5, 0, POLL, 1.0, false);
+        }
+        assert!(
+            stroke_x >= 0.25,
+            "short 5px stroke should clear deadzone (>=0.25), got {stroke_x}"
+        );
+        for _ in 0..40 {
+            look.step(0, 0, POLL, 1.0, false);
+        }
+        assert_eq!(look.step(0, 0, POLL, 1.0, false), (0.0, 0.0));
 
         // Strict boolean env parsing rejects "false", "0", " 0 ", and "".
         assert!(parse_env_flag("1"));
@@ -2503,5 +2728,47 @@ mod tests {
         // Focus loss unlocks temporarily and auto-resumes on refocus.
         assert_eq!(cap.step(false, false, false, false), (false, false));
         assert_eq!(cap.step(true, false, false, false), (true, true));
+    }
+
+    #[test]
+    fn mouse_look_is_smooth_and_continuous_without_step_impulses() {
+        let mut look = MouseLook::default();
+        let mut prev_x = 0.0;
+        for i in 0..20 {
+            let (rx, ry) = look.step(2, 0, POLL, 1.5, false);
+            assert_eq!(ry, 0.0);
+            assert!(
+                rx >= prev_x - 1e-5,
+                "continuous slow pan should be monotonic at step {i}: {prev_x} -> {rx}"
+            );
+            assert!(
+                (rx - prev_x).abs() < 0.12,
+                "adjacent step delta should be smooth (<0.12) at step {i}: {prev_x} -> {rx}"
+            );
+            prev_x = rx;
+        }
+        assert!(
+            (0.25..=0.80).contains(&prev_x),
+            "continuous slow pan should reach smooth steady plateau, got {prev_x}"
+        );
+
+        // Single 1px micro-step must not produce an abrupt jump.
+        look.reset();
+        let (micro_x, _) = look.step(1, 0, POLL, 0.5, false);
+        assert!(
+            micro_x > 0.0 && micro_x < 0.12,
+            "1px micro-step should be gentle, got {micro_x}"
+        );
+
+        // Fast continuous sweep reaches high turn rate cleanly.
+        look.reset();
+        let mut fast_x = 0.0;
+        for _ in 0..8 {
+            (fast_x, _) = look.step(8, 0, POLL, 2.0, false);
+        }
+        assert!(
+            fast_x >= 0.85,
+            "fast continuous sweep should reach high turn rate (>=0.85), got {fast_x}"
+        );
     }
 }

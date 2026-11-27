@@ -153,6 +153,9 @@ unsafe extern "system" {
     ) -> u32;
 }
 
+static SAVED_WINDOWED_RECT: Mutex<Option<RECT>> = Mutex::new(None);
+static IS_BORDERLESS: AtomicBool = AtomicBool::new(false);
+
 fn borderless_requested() -> bool {
     std::env::var("VICTORY_BORDERLESS")
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
@@ -165,11 +168,108 @@ fn apply_window_mode(parent: HWND, style: u32, x: i32, y: i32, width: i32, heigh
             (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN))
         };
         if sw > 0 && sh > 0 {
+            IS_BORDERLESS.store(true, Ordering::Relaxed);
             return (wm::WS_POPUP | wm::WS_VISIBLE, 0, 0, sw, sh);
         }
     }
+    if parent.is_null() {
+        IS_BORDERLESS.store(false, Ordering::Relaxed);
+    }
     let (fx, fy, fw, fh) = fit(parent, x, y, width, height);
     (style, fx, fy, fw, fh)
+}
+
+fn apply_live_window_mode(hwnd: HWND, borderless: bool) {
+    if hwnd.is_null() {
+        return;
+    }
+    if borderless {
+        if !IS_BORDERLESS.swap(true, Ordering::Relaxed) {
+            let mut rc = RECT::default();
+            // SAFETY: valid RECT and live HWND.
+            if unsafe { wm::GetWindowRect(hwnd, &mut rc) } != 0
+                && (rc.right - rc.left) >= 320
+                && (rc.bottom - rc.top) >= 200
+            {
+                *SAVED_WINDOWED_RECT.lock().unwrap_or_else(|e| e.into_inner()) = Some(rc);
+            }
+        }
+        // SAFETY: plain Win32 screen metrics and style/position update on our window's UI thread.
+        unsafe {
+            let sw = wm::GetSystemMetrics(wm::SM_CXSCREEN);
+            let sh = wm::GetSystemMetrics(wm::SM_CYSCREEN);
+            if sw > 0 && sh > 0 {
+                wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, (wm::WS_POPUP | wm::WS_VISIBLE) as isize);
+                wm::SetWindowPos(
+                    hwnd,
+                    wm::HWND_TOP,
+                    0,
+                    0,
+                    sw,
+                    sh,
+                    wm::SWP_FRAMECHANGED | wm::SWP_NOOWNERZORDER | wm::SWP_SHOWWINDOW,
+                );
+            }
+        }
+    } else {
+        IS_BORDERLESS.store(false, Ordering::Relaxed);
+        let saved = *SAVED_WINDOWED_RECT.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: plain Win32 workarea query and style/position update on our window's UI thread.
+        unsafe {
+            let (left, top, w, h) = if let Some(rc) = saved {
+                (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top)
+            } else {
+                let mut area = RECT::default();
+                let ok = wm::SystemParametersInfoW(
+                    wm::SPI_GETWORKAREA,
+                    0,
+                    (&raw mut area).cast(),
+                    0,
+                );
+                let (aw, ah) = if ok != 0 {
+                    (area.right - area.left, area.bottom - area.top)
+                } else {
+                    (1600, 900)
+                };
+                let (cw, ch) = fit_into(
+                    &RECT {
+                        left: 0,
+                        top: 0,
+                        right: (aw * 85) / 100,
+                        bottom: (ah * 85) / 100,
+                    },
+                    1280,
+                    720,
+                );
+                let mut rc = RECT {
+                    left: 0,
+                    top: 0,
+                    right: cw.max(640),
+                    bottom: ch.max(360),
+                };
+                let _ = wm::AdjustWindowRect(&mut rc, wm::WS_OVERLAPPEDWINDOW, 0);
+                let w = rc.right - rc.left;
+                let h = rc.bottom - rc.top;
+                let left = area.left + (aw - w) / 2;
+                let top = area.top + (ah - h) / 2;
+                (left, top, w, h)
+            };
+            wm::SetWindowLongPtrW(
+                hwnd,
+                wm::GWL_STYLE,
+                (wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE) as isize,
+            );
+            wm::SetWindowPos(
+                hwnd,
+                wm::HWND_NOTOPMOST,
+                left,
+                top,
+                w,
+                h,
+                wm::SWP_FRAMECHANGED | wm::SWP_NOOWNERZORDER | wm::SWP_SHOWWINDOW,
+            );
+        }
+    }
 }
 
 fn restart_from_menu() {
@@ -181,6 +281,55 @@ fn restart_from_menu() {
 
 fn quit_from_menu() {
     end_title("F1 menu quit", Box::new(|| {}));
+}
+
+/// Formats a clean window title for the host/game window.
+pub fn format_window_title(original: &str) -> String {
+    if let Ok(custom) = std::env::var("VICTORY_WINDOW_TITLE") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    let trimmed = original.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "victory" | "game_scarlett_master" | "game_scarlett_master.exe" | "app" | "title" | "window"
+        )
+    {
+        return "Tequesta - Grand Theft Auto VI".to_owned();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("tequesta") || lower.contains("grand theft auto") {
+        return trimmed.to_owned();
+    }
+    format!("{trimmed} - Tequesta")
+}
+
+/// Sets the console process title on Windows (`SetConsoleTitleW`).
+pub fn set_process_console_title(title: &str) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleTitleW(lp_console_title: PCWSTR) -> i32;
+    }
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: NUL-terminated UTF-16 string.
+    unsafe {
+        let _ = SetConsoleTitleW(wide.as_ptr());
+    }
+}
+
+fn apply_initial_window_title(hwnd: HWND, original: &str) {
+    if hwnd.is_null() {
+        return;
+    }
+    let title = format_window_title(original);
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: valid HWND and NUL-terminated UTF-16 string.
+    unsafe {
+        let _ = wm::SetWindowTextW(hwnd, wide.as_ptr());
+    }
 }
 
 pub extern "system" fn CreateWindowExW(
@@ -204,6 +353,17 @@ pub extern "system" fn CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
+    if parent.is_null() {
+        let orig = if name.is_null() {
+            String::new()
+        } else {
+            // SAFETY: non-null NUL-terminated UTF-16 string from caller.
+            let len = unsafe { (0..512).position(|i| *name.add(i) == 0).unwrap_or(512) };
+            // SAFETY: bounded slice of `name`.
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) })
+        };
+        apply_initial_window_title(hwnd, &orig);
+    }
     hook(hwnd, parent.is_null());
     hwnd
 }
@@ -230,6 +390,17 @@ pub extern "system" fn CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
+    if parent.is_null() {
+        let orig = if name.is_null() {
+            String::new()
+        } else {
+            // SAFETY: non-null NUL-terminated C string from caller.
+            unsafe { std::ffi::CStr::from_ptr(name.cast()) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        apply_initial_window_title(hwnd, &orig);
+    }
     hook(hwnd, parent.is_null());
     hwnd
 }
@@ -350,7 +521,11 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_INPUT {
+    if message == victory_gpu::tequesta_ui::WM_APP_DISPLAY_MODE {
+        apply_live_window_mode(hwnd, wparam != 0);
+        return 0;
+    }
+    if message == WM_INPUT && !super::gameinput::raw_pump_active() {
         let mut buf = [0u8; 64];
         let mut size = buf.len() as u32;
         // SAFETY: `lparam` is an `HRAWINPUT` handle for this `WM_INPUT` message.
@@ -785,5 +960,20 @@ mod tests {
         }
         let seen = COMMANDS.with(|c| c.borrow().clone());
         assert_eq!(seen, [wm::SC_MINIMIZE as usize]);
+    }
+
+    #[test]
+    fn formats_window_titles_cleanly() {
+        assert_eq!(format_window_title(""), "Tequesta - Grand Theft Auto VI");
+        assert_eq!(format_window_title("VIctory"), "Tequesta - Grand Theft Auto VI");
+        assert_eq!(
+            format_window_title("game_scarlett_master.exe"),
+            "Tequesta - Grand Theft Auto VI"
+        );
+        assert_eq!(
+            format_window_title("Grand Theft Auto VI"),
+            "Grand Theft Auto VI"
+        );
+        assert_eq!(format_window_title("Custom Title"), "Custom Title - Tequesta");
     }
 }

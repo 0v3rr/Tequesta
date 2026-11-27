@@ -5,8 +5,7 @@
 //! Ported from XCL (github.com/ivall/xcl, GPL-2.0-only): `insn.rs` (decoder, as
 //! `console_insn_decode.rs`, unchanged) and `eh.rs` `emulate_console_only`.
 
-#[path = "console_insn_decode.rs"]
-mod decode;
+use crate::console_insn_decode as decode;
 
 use decode::ConsoleOnly;
 use std::cell::Cell;

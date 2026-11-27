@@ -630,6 +630,74 @@ pub fn precompile_shaders_and_pipelines(game_dir: PathBuf, jobs: Option<usize>) 
     Ok(())
 }
 
+/// File size cap for background startup shader prewarming so multi-GB game
+/// archives are not read into memory during live gameplay.
+#[cfg(windows)]
+const STARTUP_PREWARM_MAX_FILE: u64 = 64 << 20;
+
+/// Spawns a non-blocking background worker on launch that prewarms shader
+/// containers under `title_dir` into `shaders_dir` if not already completed
+/// for the current translator version and title directory.
+#[cfg(windows)]
+pub fn spawn_startup_shader_prewarm(title_dir: PathBuf, shaders_dir: PathBuf) {
+    let dir_hash = blake3::hash(title_dir.to_string_lossy().as_bytes()).to_hex();
+    let marker = shaders_dir.join(format!(
+        "startup-prewarm-v{}-{}.done",
+        victory_shader::TRANSLATOR_VERSION,
+        &dir_hash[..8]
+    ));
+    if marker.exists() {
+        tracing::info!(
+            marker = %marker.display(),
+            "startup shader prewarm already completed for this translator version"
+        );
+        return;
+    }
+
+    let spawn = std::thread::Builder::new()
+        .name("tequesta-shader-prewarm".into())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            let mut seen = HashSet::new();
+            let mut translated = 0usize;
+            let mut cached = 0usize;
+            let mut failed = 0usize;
+            let mut scan = FileScan::new(STARTUP_PREWARM_MAX_FILE, false);
+            for (_path, data) in scan.files(&title_dir) {
+                for job in sources(&data) {
+                    let Some(bytes) = job.bytes() else {
+                        continue;
+                    };
+                    let hash = blake3::hash(&bytes);
+                    if !seen.insert(hash) {
+                        continue;
+                    }
+                    match victory_hle::modules::d3d12x::warm_shader(&bytes) {
+                        Ok(true) => translated += 1,
+                        Ok(false) => cached += 1,
+                        Err(_) => failed += 1,
+                    }
+                }
+            }
+            let summary = format!(
+                "translated={translated} cached={cached} failed={failed} elapsed_s={:.1}\n",
+                started.elapsed().as_secs_f64()
+            );
+            let _ = std::fs::write(&marker, summary);
+            tracing::info!(
+                translated,
+                cached,
+                failed,
+                elapsed_s = started.elapsed().as_secs_f64(),
+                marker = %marker.display(),
+                "startup shader prewarm finished"
+            );
+        });
+    if let Err(err) = spawn {
+        tracing::warn!(%err, "failed to spawn startup shader prewarm worker");
+    }
+}
+
 fn translate(
     source: &Source,
     path: &Path,

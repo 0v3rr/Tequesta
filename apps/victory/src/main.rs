@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(
     name = "victory",
     version,
-    about = "Run an Xbox Series title natively on Windows"
+    about = "Tequesta (VIctory): run an Xbox Series title natively on Windows"
 )]
 struct Cli {
     /// Translate all RDNA2 shaders under GAME_DIR to DXIL in parallel and
@@ -178,6 +178,16 @@ enum Command {
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
+    /// Analyze a PE32+ image for static recompilation and optionally emit static patches.
+    Recomp {
+        file: PathBuf,
+        /// Write a copy of the PE with safe static console-instruction patches applied.
+        #[arg(long)]
+        patch_out: Option<PathBuf>,
+        /// List discovered console-instruction rewrite sites.
+        #[arg(long)]
+        list_sites: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -274,7 +284,43 @@ fn main() -> Result<()> {
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
+        Command::Recomp {
+            file,
+            patch_out,
+            list_sites,
+        } => run_recomp(&file, patch_out.as_deref(), list_sites),
     }
+}
+
+fn run_recomp(file: &PathBuf, patch_out: Option<&std::path::Path>, list_sites: bool) -> Result<()> {
+    let bytes = std::fs::read(file)?;
+    let plan = victory_loader::recomp::analyze(&bytes)?;
+    println!("{}", plan.format_summary());
+    if list_sites {
+        for site in &plan.rewrite_sites {
+            println!(
+                "  rva={:#010x} offset={:#010x} len={} kind={:?} patchable={}",
+                site.rva,
+                site.file_offset,
+                site.len,
+                site.kind,
+                site.patch.is_some()
+            );
+        }
+    }
+    if let Some(out_path) = patch_out {
+        victory_core::ensure_outside_repo(out_path)?;
+        let (patched, stats) = victory_loader::recomp::apply_static_patches(&bytes, &plan);
+        std::fs::write(out_path, patched)?;
+        println!(
+            "wrote {} (patched_sites={}, patched_bytes={}, deferred_sites={})",
+            out_path.display(),
+            stats.patched_sites,
+            stats.patched_bytes,
+            stats.deferred_sites
+        );
+    }
+    Ok(())
 }
 
 fn show_config() -> Result<()> {
@@ -359,5 +405,11 @@ mod tests {
 
         let shaders_cli = Cli::try_parse_from(["victory", "shaders", "C:\\Game"]).unwrap();
         assert!(matches!(shaders_cli.command, Some(Command::Shaders { .. })));
+
+        let recomp_cli = Cli::try_parse_from(["victory", "recomp", "game.exe", "--list-sites"]).unwrap();
+        assert!(matches!(
+            recomp_cli.command,
+            Some(Command::Recomp { list_sites: true, patch_out: None, .. })
+        ));
     }
 }

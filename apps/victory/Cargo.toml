@@ -1,6 +1,6 @@
 [package]
 name = "victory"
-description = "Command-line front end: inspect, census, convert, run."
+description = "Tequesta (VIctory) runtime & CLI front end: inspect, census, recomp, translate, run."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -9812,8 +9812,9 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        let base = String::from_utf16_lossy(caption);
+        let formatted = format_meter_caption(&base, fps, ms, draws);
+        let mut text: Vec<u16> = formatted.encode_utf16().collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
@@ -9840,10 +9841,40 @@ impl Meter {
     }
 }
 
+fn format_meter_caption(base: &str, fps: f64, ms: f64, draws: f64) -> String {
+    let trimmed = base.trim();
+    let title = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("victory") {
+        "Tequesta - Grand Theft Auto VI"
+    } else {
+        trimmed
+    };
+    if title.to_ascii_lowercase().contains("tequesta") {
+        format!("{title} | {fps:.0} FPS ({ms:.1} ms, {draws:.0} draws)")
+    } else {
+        format!("{title} | Tequesta {fps:.0} FPS ({ms:.1} ms, {draws:.0} draws)")
+    }
+}
+
 #[cfg(test)]
 mod present_status_tests {
-    use super::{HWND, Meter};
+    use super::{HWND, Meter, format_meter_caption};
     use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_FAIL, S_OK};
+
+    #[test]
+    fn formats_meter_caption_without_duplicate_branding() {
+        assert_eq!(
+            format_meter_caption("", 27.0, 37.0, 4200.0),
+            "Tequesta - Grand Theft Auto VI | 27 FPS (37.0 ms, 4200 draws)"
+        );
+        assert_eq!(
+            format_meter_caption("VIctory", 27.0, 37.0, 4200.0),
+            "Tequesta - Grand Theft Auto VI | 27 FPS (37.0 ms, 4200 draws)"
+        );
+        assert_eq!(
+            format_meter_caption("Grand Theft Auto VI", 27.0, 37.0, 4200.0),
+            "Grand Theft Auto VI | Tequesta 27 FPS (37.0 ms, 4200 draws)"
+        );
+    }
 
     #[test]
     fn the_meter_counts_successful_presents_across_a_failure() {
@@ -10786,12 +10817,57 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == crate::tequesta_ui::WM_APP_DISPLAY_MODE {
+        let borderless = wparam.0 != 0;
+        // SAFETY: plain Win32 style/rect update on our fallback window's UI thread.
+        unsafe {
+            if borderless {
+                let sw = GetSystemMetrics(SM_CXSCREEN);
+                let sh = GetSystemMetrics(SM_CYSCREEN);
+                if sw > 0 && sh > 0 {
+                    SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP.0 | WS_VISIBLE.0) as isize);
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(HWND_TOP),
+                        0,
+                        0,
+                        sw,
+                        sh,
+                        SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+                    );
+                }
+            } else {
+                let mut rc = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1280,
+                    bottom: 720,
+                };
+                let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
+                SetWindowLongPtrW(
+                    hwnd,
+                    GWL_STYLE,
+                    (WS_OVERLAPPEDWINDOW.0 | WS_VISIBLE.0) as isize,
+                );
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_NOTOPMOST),
+                    80,
+                    80,
+                    rc.right - rc.left,
+                    rc.bottom - rc.top,
+                    SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+                );
+            }
+        }
+        return LRESULT(0);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
-    const CLASS: PCWSTR = w!("VIctory");
+    const CLASS: PCWSTR = w!("TequestaWindow");
     // SAFETY: registers our class once and creates a window of it.
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -10814,7 +10890,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
+            w!("Tequesta - Grand Theft Auto VI"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,

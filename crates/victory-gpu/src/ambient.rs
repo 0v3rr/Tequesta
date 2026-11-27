@@ -34,6 +34,7 @@
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -97,19 +98,62 @@ fn set() -> Set {
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
+/// Live override from the `F1` menu (`0` = env default, `1` = off, `2` = on).
+static LIVE_ENABLED: AtomicU8 = AtomicU8::new(0);
+static LIVE_GUARD: OnceLock<AtomicBool> = OnceLock::new();
+
+fn guard_flag() -> &'static AtomicBool {
+    LIVE_GUARD.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_REFLECTION_GUARD").is_some_and(|v| v == "1");
+        AtomicBool::new(on)
+    })
+}
+
+/// Enables or disables the ambient GI stand-in at runtime (from `F1` menu).
+pub fn set_enabled(on: bool) {
+    LIVE_ENABLED.store(if on { 2 } else { 1 }, Relaxed);
+}
+
+/// Enables or disables the reflection / probe-tile & indoor brown-fog guard at runtime.
+pub fn set_probe_guard(on: bool) {
+    guard_flag().store(on, Relaxed);
+}
+
+/// Whether the reflection & probe-tile guard is active.
+#[inline]
+pub fn probe_guard_on() -> bool {
+    guard_flag().load(Relaxed)
+}
+
+fn effective_set() -> Set {
+    match LIVE_ENABLED.load(Relaxed) {
+        1 => Set::Off,
+        2 => match set() {
+            Set::Off => Set::Estimate(1.1),
+            other => other,
+        },
+        _ => set(),
+    }
+}
+
 /// Whether the stand-in is on: set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    effective_set() != Set::Off && !crate::pipeline::builder_runs()
 }
 
 /// The most the air scatters, as a multiple of the light around
-/// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
+/// (`VICTORY_AMBIENT_AIR=<multiple>`; unset: `4.0` when `probe_guard_on()`, else `0.0`).
 fn air() -> f32 {
-    static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
-    })
+    static SET: OnceLock<Option<f32>> = OnceLock::new();
+    let explicit = *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_AIR").ok()?;
+        let trimmed = set.trim();
+        if trimmed == "0" || trimmed.eq_ignore_ascii_case("off") {
+            return Some(0.0);
+        }
+        trimmed.parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0)
+    });
+    explicit.unwrap_or_else(|| if probe_guard_on() { 4.0 } else { 0.0 })
 }
 
 /// How the slow mean of the light around follows the frames
@@ -323,10 +367,16 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float far = float(at.z) / float(d);
-    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    float cap = max(air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far), 0.05);
     float3 c = scattered[at];
+    bool bad = any(isnan(c)) || any(isinf(c)) || any(c < 0.0);
+    c = any(isnan(c)) || any(isinf(c)) ? 0.0 : max(c, 0.0);
     float has = dot(c, LUMA);
-    if (has > cap) scattered[at] = c * (cap / has);
+    if (has > cap) {
+        scattered[at] = c * (cap / has);
+    } else if (bad) {
+        scattered[at] = c;
+    }
 }
 #endif
 
@@ -402,6 +452,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
     float3 was = unpack(light[p]);
     // Filter magenta garbage probes left by uninitialized/corrupted memory on AMD.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
@@ -519,6 +570,7 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
 /// Whether the light of a frame has been kept: the estimate has something
 /// to begin with.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARMED_FRAMES: AtomicU32 = AtomicU32::new(0);
 
 /// What the passes read and write, as views in the heap the list has set.
 pub(crate) struct Views {
@@ -539,7 +591,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
-    let (level, constant) = match set() {
+    let (level, constant) = match effective_set() {
         Set::Off => return false,
         Set::Estimate(level) => (level, 0.0f32),
         Set::Constant(level) => (0.0, level),
@@ -547,7 +599,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::Air && (constant > 0.0 || air() == 0.0 || (probe_guard_on() && WARMED_FRAMES.load(Relaxed) < 30)) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -570,7 +622,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = if probe_guard_on() { 3.0f32 } else { 4.0f32 }.to_bits();
     words[10] = air().to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
@@ -599,6 +651,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.keep, 8, 9, 1);
                 run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
+                WARMED_FRAMES.fetch_add(1, Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
@@ -625,6 +678,7 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+        assert!(!probe_guard_on());
     }
 
     #[test]

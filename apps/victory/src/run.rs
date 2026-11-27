@@ -39,6 +39,35 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartupCacheOptions {
+    shader_prewarm: bool,
+    pipeline_precache: bool,
+}
+
+#[cfg(any(windows, test))]
+fn parse_env_bool(val: Option<&str>, default: bool) -> bool {
+    match val {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => default,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn resolve_startup_cache_options(
+    shader_env: Option<&str>,
+    pipeline_env: Option<&str>,
+) -> StartupCacheOptions {
+    StartupCacheOptions {
+        shader_prewarm: parse_env_bool(shader_env, true),
+        pipeline_precache: parse_env_bool(pipeline_env, true),
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -53,6 +82,7 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+        victory_hle::modules::lifecycle::set_process_console_title("Tequesta - Grand Theft Auto VI");
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
@@ -67,7 +97,24 @@ pub fn run(
     }
 
     let images = cfg.cache_subdir("images")?;
-    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let cache_opts = resolve_startup_cache_options(
+        std::env::var("VICTORY_SHADER_PREWARM").ok().as_deref(),
+        std::env::var("VICTORY_PIPELINE_PRECACHE").ok().as_deref(),
+    );
+    let shaders_dir = cfg.cache_subdir("shaders")?;
+    let pipelines_dir = cfg.cache_subdir("pipelines")?;
+    if cache_opts.shader_prewarm {
+        victory_hle::modules::d3d12x::use_shader_cache_only(shaders_dir.clone());
+        println!("shader preload enabled ({})", shaders_dir.display());
+    } else {
+        println!("shader preload disabled");
+    }
+    if cache_opts.pipeline_precache {
+        victory_hle::modules::d3d12x::use_pipeline_cache(pipelines_dir.clone());
+        println!("pipeline cache enabled ({})", pipelines_dir.display());
+    } else {
+        println!("pipeline cache disabled");
+    }
     let image = if let Some(preset) = fsr {
         anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
         fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
@@ -237,6 +284,9 @@ pub fn run(
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
+    }
+    if cache_opts.shader_prewarm {
+        crate::translate::spawn_startup_shader_prewarm(title_dir.to_path_buf(), shaders_dir);
     }
     victory_loader::report_crashes();
     victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
@@ -634,6 +684,40 @@ mod cpu_check_tests {
     #[test]
     fn skip_env_var_bypasses_missing_avx2() {
         assert!(check_cpu_features_with(false, Some("1")).is_ok());
+    }
+
+    #[test]
+    fn startup_cache_options_default_enabled_and_respect_flags() {
+        use super::{StartupCacheOptions, resolve_startup_cache_options};
+
+        assert_eq!(
+            resolve_startup_cache_options(None, None),
+            StartupCacheOptions {
+                shader_prewarm: true,
+                pipeline_precache: true,
+            }
+        );
+        assert_eq!(
+            resolve_startup_cache_options(Some("0"), Some("1")),
+            StartupCacheOptions {
+                shader_prewarm: false,
+                pipeline_precache: true,
+            }
+        );
+        assert_eq!(
+            resolve_startup_cache_options(Some("true"), Some("false")),
+            StartupCacheOptions {
+                shader_prewarm: true,
+                pipeline_precache: false,
+            }
+        );
+        assert_eq!(
+            resolve_startup_cache_options(Some("off"), Some("0")),
+            StartupCacheOptions {
+                shader_prewarm: false,
+                pipeline_precache: false,
+            }
+        );
     }
 }
 
