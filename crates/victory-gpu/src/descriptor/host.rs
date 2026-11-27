@@ -3794,6 +3794,96 @@ macro_rules! once {
     }};
 }
 
+/// Sanitizes a texture SRV `Shader4ComponentMapping`: preserves valid custom
+/// channel swizzles (selectors `0..=5`) while ensuring D3D12's required bit 12
+/// (`ALWAYS_SET_BIT`) is set, and falls back to `D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING`
+/// when zero or invalid.
+fn sanitize_component_mapping(mapping: u32) -> u32 {
+    if mapping == 0 {
+        return D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    }
+    for i in 0..4 {
+        if ((mapping >> (3 * i)) & 7) > 5 {
+            return D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        }
+    }
+    (mapping & 0x0fff) | 0x1000
+}
+
+/// Builds a concrete default texture SRV description for a typeless host
+/// texture when the title passed `None` (whole-resource view).
+fn default_typed_srv_desc(texture: &ID3D12Resource, format: u32) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT(format as i32),
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            if d.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: u32::from(d.MipLevels),
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                    ResourceMinLODClamp: 0.0,
+                };
+            } else {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+                desc.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: u32::from(d.MipLevels),
+                    ResourceMinLODClamp: 0.0,
+                };
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            if d.SampleDesc.Count > 1 {
+                if d.DepthOrArraySize > 1 {
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                    desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                        FirstArraySlice: 0,
+                        ArraySize: u32::from(d.DepthOrArraySize),
+                    };
+                } else {
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                }
+            } else if d.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: u32::from(d.MipLevels),
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                };
+            } else {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: u32::from(d.MipLevels),
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                };
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::from(d.MipLevels),
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -3936,21 +4026,39 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    let (home, _, address, len) = buffer_copy_with_parent(view)?;
+    Some((home, address, len))
+}
+
+/// Like [`buffer_copy`], also returning the parent buffer's host copy when
+/// `view_home` split the view onto an `exact` copy (`!Arc::ptr_eq(&home, &parent)`).
+pub(crate) fn buffer_copy_with_parent(
+    view: &View,
+) -> Option<(
+    std::sync::Arc<crate::shadow::Shadow>,
+    Option<std::sync::Arc<crate::shadow::Shadow>>,
+    u64,
+    u64,
+)> {
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
     }
-    if view_extent()
+    let elements = view_elements(view)?;
+    let parent = if view_extent()
         && let Some((base, width)) = buffer_extent(view)
         // (The console is lax: a view may begin past its buffer's end.)
         && address >= base
         && address - base < width.max(1)
         && let Some(shadow) = crate::shadow::find(base, width)
     {
-        return Some((view_home(shadow, address, len, view_elements(view)?), address, len));
-    }
-    let shadow = crate::shadow::find(address, len)?;
-    Some((view_home(shadow, address, len, view_elements(view)?), address, len))
+        shadow
+    } else {
+        crate::shadow::find(address, len)?
+    };
+    let home = view_home(parent.clone(), address, len, elements);
+    let split_parent = (!std::sync::Arc::ptr_eq(&home, &parent)).then_some(parent);
+    Some((home, split_parent, address, len))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -4593,6 +4701,16 @@ fn make_twinned(
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                if let Some(d) = &mut desc {
+                    d.Shader4ComponentMapping = sanitize_component_mapping(d.Shader4ComponentMapping);
+                    if d.Format.0 == 0
+                        && let Some(own_fmt) = crate::resource::view_format(resource)
+                    {
+                        d.Format = DXGI_FORMAT(own_fmt as i32);
+                    }
+                } else if let Some(own_fmt) = crate::resource::view_format(resource) {
+                    desc = default_typed_srv_desc(texture, own_fmt);
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -4606,9 +4724,10 @@ fn make_twinned(
                 {
                     // SAFETY: a live resource.
                     let own = unsafe { texture.GetDesc() };
+                    let whole_fmt = crate::resource::view_format(resource).unwrap_or(own.Format.0 as u32);
                     // The texture's own view (the title gave none): all of it.
                     let whole = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                        Format: own.Format,
+                        Format: DXGI_FORMAT(whole_fmt as i32),
                         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
                         Shader4ComponentMapping: 5768,
                         Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -5745,6 +5864,60 @@ mod tests {
         } else {
             assert_eq!(words(), before);
         }
+    }
+
+    #[test]
+    fn sanitize_component_mapping_preserves_valid_and_fixes_invalid() {
+        assert_eq!(sanitize_component_mapping(0), D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+        assert_eq!(sanitize_component_mapping(5768), 5768);
+        // Valid custom swizzle (e.g. R,G,B,1) without bit 12 set gets bit 12 set.
+        let rgb1 = (0) | (1 << 3) | (2 << 6) | (5 << 9);
+        assert_eq!(sanitize_component_mapping(rgb1), rgb1 | 0x1000);
+        // Selector 6 or 7 is invalid -> default.
+        assert_eq!(sanitize_component_mapping(6 | 0x1000), D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+        assert_eq!(sanitize_component_mapping(7 << 9), D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    }
+
+    #[test]
+    fn bc7_typeless_host_texture_allows_both_unorm_and_srgb_srvs() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = host() else { return };
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(97), // DXGI_FORMAT_BC7_TYPELESS
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let heap_props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut tex: Option<ID3D12Resource> = None;
+        // SAFETY: plain committed BC7_TYPELESS texture.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, None, &mut tex)
+                .unwrap();
+        }
+        let tex = tex.unwrap();
+        let mut fmt_unorm = DXGI_FORMAT(98);
+        let mut fmt_srgb = DXGI_FORMAT(99);
+        assert!(fits(&tex, Some(&mut fmt_unorm), false));
+        assert!(fits(&tex, Some(&mut fmt_srgb), false));
+        assert_eq!(fmt_unorm.0, 98);
+        assert_eq!(fmt_srgb.0, 99);
+        for (slot, fmt) in [(0, 98), (1, 99)] {
+            let srv = default_typed_srv_desc(&tex, fmt).unwrap();
+            // SAFETY: live texture and descriptor heap slot.
+            unsafe { host.device.CreateShaderResourceView(&tex, Some(&srv), heap.cpu(slot)) };
+        }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// Views that begin where no host view can: raw ones off 16 bytes,

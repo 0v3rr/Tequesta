@@ -61,6 +61,7 @@ Tequesta translates native Windows `WM_INPUT` raw mouse movement and layout-inde
 | **Jump / Climb** | `Space` | `X` |
 | **Reload / Melee** | `R` | `B` |
 | **Enter / Exit Vehicle** | `F` | `Y` |
+| **Interact / Talk** | `E` | `D-Pad Right` |
 | **Interact** | `E` | D-Pad Right |
 | **Cover / Handbrake** | `Q` (QWERTY) / `A` (AZERTY) | `RB` |
 | **Weapon Wheel** | `Tab` | `LB` |
@@ -93,3 +94,10 @@ Pressing `F1` opens the native D3D12 settings overlay (`tequesta_ui.rs`). Change
 | `VICTORY_CARD_REHASH_RUNS` | `1` | Batches unified GPU memory card-table rehashes |
 | `VICTORY_KBM_NATIVE` | `1` | Enables native `WM_INPUT` raw mouse and scancode keyboard input |
 | `VICTORY_RAW_VIEWS` | `0` | Keeps 4 MiB `ExactArenaPool` sub-allocation active (essential for NVIDIA drivers) |
+
+### Offline Shader & Pipeline Precompilation
+Pre-translate RDNA2 shaders to DXIL in parallel and populate the `ID3D12PipelineLibrary1` cache before launching:
+
+```powershell
+cargo run --release --locked -p victory -- --precompile-shaders "<PATH_TO_GAME_DIR>"
+```

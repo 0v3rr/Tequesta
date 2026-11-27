@@ -782,20 +782,22 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
-        if count > 0 {
-            with_state(this, |_, state| state.synced());
-        }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        let has_buffer_barrier = barriers.iter().any(|b| {
+            (!b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some())
+                || (b.kind == 1 && b.second != 0 && crate::resource::buffer_bytes(b.second as This).is_some())
+        });
+        if count > 0 {
+            with_state(this, |l, state| state.synced_on(l, has_buffer_barrier));
+        }
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
+        if has_buffer_barrier {
             host.push(UAV_BARRIER);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
@@ -1051,24 +1053,48 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
+            from.footprint.format = crate::resource::concrete_copy_format(crate::resource::pc_format(
+                from.footprint.format,
+            ));
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let buffer = match list.place_source(data as usize, bytes as usize) {
-                // What shaders wrote to it, at this place of the list.
-                Some(buffer) => buffer,
-                None => {
-                    let Some((buffer, staging)) = list.upload(host, bytes) else {
-                        return;
-                    };
-                    // The list owns this mapped D3D12 upload buffer. Wine can
-                    // report its address as MEM_FREE, so use the host-upload
-                    // path.
-                    list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
-                    buffer
+            let buffer = if !from.footprint.row_pitch.is_multiple_of(256) || from.footprint.row_pitch == 0 {
+                let Some((aligned_fp, [aligned_bytes, row_bytes, lines, src_pitch])) =
+                    from.footprint.host_rows()
+                else {
+                    return;
+                };
+                let Some((buffer, staging)) = list.upload(host, aligned_bytes) else {
+                    return;
+                };
+                list.defer_fill_rows(
+                    staging,
+                    data,
+                    row_bytes as usize,
+                    lines as usize,
+                    src_pitch as usize,
+                    aligned_fp.row_pitch as usize,
+                );
+                from.footprint = aligned_fp;
+                buffer
+            } else {
+                match list.place_source(data as usize, bytes as usize) {
+                    // What shaders wrote to it, at this place of the list.
+                    Some(buffer) => buffer,
+                    None => {
+                        let Some((buffer, staging)) = list.upload(host, bytes) else {
+                            return;
+                        };
+                        // The list owns this mapped D3D12 upload buffer. Wine can
+                        // report its address as MEM_FREE, so use the host-upload
+                        // path.
+                        list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
+                        buffer
+                    }
                 }
             };
             from.resource = buffer.as_raw().cast_const().cast();
@@ -1561,7 +1587,7 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
     {
-        with_state(this, |_, state| state.synced());
+        with_state(this, |l, state| state.synced_on(l, true));
         if let Some(list) = host_list(this) {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             #[cfg(feature = "diagnostics")]
@@ -2154,7 +2180,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        with_state(this, |_, state| state.synced());
+        with_state(this, |l, state| state.synced_on(l, true));
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.

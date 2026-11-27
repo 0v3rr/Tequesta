@@ -813,6 +813,20 @@ pub fn save_pipeline_cache() {
     known::flush();
 }
 
+/// Pre-compiles a standalone compute shader container into the active
+/// `ID3D12PipelineLibrary1` cache. Returns `true` if compiled or loaded.
+#[cfg(windows)]
+pub fn precompile_compute_pso(container: &[u8]) -> bool {
+    let s = shader("compute", container);
+    host::HostPipeline::new(&[s], None).is_some()
+}
+
+/// Returns `(made, loaded, saved_bytes)` for the host pipeline library.
+#[cfg(windows)]
+pub fn pipeline_cache_stats() -> (u64, u64, u64) {
+    library::stats()
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]

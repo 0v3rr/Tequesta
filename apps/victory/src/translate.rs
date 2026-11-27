@@ -493,6 +493,143 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
     Ok(())
 }
 
+fn is_compute_container(bytes: &[u8]) -> bool {
+    let Ok(container) = Container::parse(bytes) else {
+        return false;
+    };
+    let Some(dxil) = container
+        .part(FourCC::DXIL)
+        .or(container.part(FourCC::ACCC))
+        .map(|p| p.data)
+    else {
+        return false;
+    };
+    native_programs(dxil)
+        .is_ok_and(|progs| progs.iter().any(|p| p.stage == HwStage::Cs))
+}
+
+/// Offline `--precompile-shaders <game_dir>`: translates every RDNA2 shader
+/// under `game_dir` to DXIL in parallel across CPU threads and pre-compiles
+/// available PSOs into the serialized `ID3D12PipelineLibrary1` cache on disk.
+pub fn precompile_shaders_and_pipelines(game_dir: PathBuf, jobs: Option<usize>) -> Result<()> {
+    anyhow::ensure!(
+        game_dir.exists(),
+        "game directory does not exist: {}",
+        game_dir.display()
+    );
+    let cfg = victory_core::Config::load()?;
+    let shaders_dir = cfg.cache_subdir("shaders")?;
+    let pipelines_dir = shaders_dir.with_file_name("pipelines");
+    victory_hle::modules::d3d12x::use_shader_cache(shaders_dir.clone());
+
+    let threads = worker_threads(jobs);
+    let started = std::time::Instant::now();
+    let seen = Mutex::new(HashSet::new());
+    let done = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    let compute_blobs: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    let mut scan = FileScan::new(MAX_FILE, false);
+
+    println!(
+        "precompile   scanning {} ({threads} threads)",
+        game_dir.display()
+    );
+    for (_path, data) in scan.files(&game_dir) {
+        let jobs = sources(&data);
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads.min(jobs.len()).max(1) {
+                if jobs.is_empty() {
+                    break;
+                }
+                s.spawn(|| {
+                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let Some(bytes) = job.bytes() else { continue };
+                        let hash = blake3::hash(&bytes);
+                        if !lock(&seen).insert(hash) {
+                            continue;
+                        }
+                        match victory_hle::modules::d3d12x::precompile(&bytes) {
+                            Ok(_) => {
+                                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n.is_multiple_of(1000) {
+                                    println!(
+                                        "shaders      {n} cached, {:.0} s",
+                                        started.elapsed().as_secs_f64()
+                                    );
+                                }
+                                if is_compute_container(&bytes) {
+                                    lock(&compute_blobs).push(bytes.into_owned());
+                                }
+                            }
+                            Err(_) => {
+                                failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    println!(
+        "shaders      {} cached, {} failed, {:.1} s -> {}",
+        done.load(Ordering::Relaxed),
+        failed.load(Ordering::Relaxed),
+        started.elapsed().as_secs_f64(),
+        shaders_dir.display()
+    );
+
+    #[cfg(windows)]
+    {
+        let pso_started = std::time::Instant::now();
+        let pso_threads = threads.min(8);
+        let (known_ok, known_bad, known_fail) =
+            victory_hle::known_pipelines::precompile_into_library(&pipelines_dir, pso_threads);
+        let blobs = compute_blobs.into_inner().unwrap_or_else(|e| e.into_inner());
+        let next = AtomicUsize::new(0);
+        let cs_ok = AtomicUsize::new(0);
+        let cs_fail = AtomicUsize::new(0);
+        if !blobs.is_empty() {
+            std::thread::scope(|s| {
+                for _ in 0..pso_threads.min(blobs.len()) {
+                    s.spawn(|| {
+                        while let Some(blob) = blobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            if victory_hle::modules::d3d12x::precompile_compute_pso(blob) {
+                                let n = cs_ok.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n.is_multiple_of(500) {
+                                    println!(
+                                        "pipelines    {n}/{} compute PSOs, {:.0} s",
+                                        blobs.len(),
+                                        pso_started.elapsed().as_secs_f64()
+                                    );
+                                }
+                            } else {
+                                cs_fail.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        victory_hle::modules::d3d12x::save_pipeline_cache();
+        let (made, loaded, saved_bytes) = victory_hle::modules::d3d12x::pipeline_cache_stats();
+        let lib_path = pipelines_dir.join("host-pipelines.bin");
+        println!(
+            "pipelines    known ok={known_ok} bad={known_bad} fail={known_fail}; compute ok={} fail={}; library made={made} loaded={loaded} saved={} MiB ({}) in {:.1} s",
+            cs_ok.load(Ordering::Relaxed),
+            cs_fail.load(Ordering::Relaxed),
+            saved_bytes >> 20,
+            lib_path.display(),
+            pso_started.elapsed().as_secs_f64()
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (pipelines_dir, compute_blobs);
+    }
+    Ok(())
+}
+
 fn translate(
     source: &Source,
     path: &Path,

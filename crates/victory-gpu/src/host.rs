@@ -7346,6 +7346,40 @@ impl HostList {
         self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
     }
 
+    /// Repacks rows of title memory (`src_pitch` bytes apart, `lines` rows of
+    /// `row_bytes` active bytes) into `dst` with `dst_pitch` alignment (zeroing
+    /// row padding), at submission time.
+    pub(crate) fn defer_fill_rows(
+        &self,
+        dst: *mut u8,
+        src: *const u8,
+        row_bytes: usize,
+        lines: usize,
+        src_pitch: usize,
+        dst_pitch: usize,
+    ) {
+        let dst_addr = dst as usize;
+        let src_addr = src as usize;
+        let src_span = lines
+            .saturating_sub(1)
+            .saturating_mul(src_pitch)
+            .saturating_add(row_bytes);
+        self.deferred().copies.push(Step::Host(
+            Box::new(move || {
+                for row in 0..lines {
+                    let s = (src_addr + row * src_pitch) as *const u8;
+                    let d = (dst_addr + row * dst_pitch) as *mut u8;
+                    copy_mapped(d, s, row_bytes, false);
+                    if dst_pitch > row_bytes {
+                        // SAFETY: `dst_addr` covers `lines * dst_pitch` bytes in the upload buffer.
+                        unsafe { std::ptr::write_bytes(d.add(row_bytes), 0, dst_pitch - row_bytes) };
+                    }
+                }
+            }),
+            (src_addr, src_addr.saturating_add(src_span)),
+        ));
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.

@@ -26,8 +26,15 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {
+    /// Translate all RDNA2 shaders under GAME_DIR to DXIL in parallel and
+    /// pre-compile available D3D12 PSOs into the pipeline library cache.
+    #[arg(long, value_name = "GAME_DIR")]
+    precompile_shaders: Option<PathBuf>,
+    /// Worker threads for --precompile-shaders (default: every logical core).
+    #[arg(long, value_parser = parse_jobs)]
+    jobs: Option<usize>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -200,7 +207,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command {
+    if let Some(game_dir) = cli.precompile_shaders {
+        return translate::precompile_shaders_and_pipelines(game_dir, cli.jobs);
+    }
+    let Some(command) = cli.command else {
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        println!();
+        std::process::exit(2);
+    };
+    match command {
         Command::Inspect {
             file,
             imports,
@@ -328,5 +344,20 @@ mod tests {
         assert!(check_policy([&outside]).is_ok());
         let err = check_policy([&outside, &inside, &inside]).unwrap_err();
         assert_eq!(err.to_string(), "2 policy violation(s)");
+    }
+
+    #[test]
+    fn cli_parses_precompile_shaders_and_subcommands() {
+        let cli = Cli::try_parse_from(["victory", "--precompile-shaders", "C:\\Game", "--jobs", "4"]).unwrap();
+        assert_eq!(cli.precompile_shaders.as_deref(), Some(std::path::Path::new("C:\\Game")));
+        assert_eq!(cli.jobs, Some(4));
+        assert!(cli.command.is_none());
+
+        let run_cli = Cli::try_parse_from(["victory", "run", "game.exe", "--execute"]).unwrap();
+        assert!(run_cli.precompile_shaders.is_none());
+        assert!(matches!(run_cli.command, Some(Command::Run { execute: true, .. })));
+
+        let shaders_cli = Cli::try_parse_from(["victory", "shaders", "C:\\Game"]).unwrap();
+        assert!(matches!(shaders_cli.command, Some(Command::Shaders { .. })));
     }
 }

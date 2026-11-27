@@ -631,7 +631,55 @@ pub(crate) fn family(format: u32) -> u32 {
 }
 
 /// sRGB formats and their linear twins.
-pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+pub(crate) const SRGB: [(u32, u32); 7] = [
+    (29, 28), // R8G8B8A8_UNORM_SRGB / UNORM
+    (72, 71), // BC1_UNORM_SRGB / UNORM
+    (75, 74), // BC2_UNORM_SRGB / UNORM
+    (78, 77), // BC3_UNORM_SRGB / UNORM
+    (91, 87), // B8G8R8A8_UNORM_SRGB / UNORM
+    (93, 88), // B8G8R8X8_UNORM_SRGB / UNORM
+    (99, 98), // BC7_UNORM_SRGB / UNORM
+];
+
+/// Typeless format for an sRGB/UNORM-castable texture format (R8G8B8A8,
+/// BC1, BC2, BC3, B8G8R8A8, B8G8R8X8, BC7), so title-filled textures can
+/// be sampled with either `_UNORM` or `_UNORM_SRGB` views.
+pub(crate) fn srgb_castable_typeless(format: u32) -> Option<u32> {
+    Some(match format {
+        28 | 29 => 27,
+        71 | 72 => 70,
+        74 | 75 => 73,
+        77 | 78 => 76,
+        87 | 91 => 90,
+        88 | 93 => 92,
+        98 | 99 => 97,
+        _ => return None,
+    })
+}
+
+/// Concrete typed format for a typeless format, for `GetCopyableFootprints`
+/// and `CopyTextureRegion` footprints (which require typed formats on PC).
+pub(crate) fn concrete_copy_format(format: u32) -> u32 {
+    match format {
+        27 => 28,
+        70 => 71,
+        73 => 74,
+        76 => 77,
+        79 => 80,
+        82 => 83,
+        90 => 87,
+        92 => 88,
+        94 => 95,
+        97 => 98,
+        other => other,
+    }
+}
+
+#[cfg(windows)]
+fn typeless_srgb_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TYPELESS_SRGB").is_none_or(|v| v != "0"))
+}
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -675,11 +723,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
+    pub(crate) format: u32,
     width: u32,
     height: u32,
     depth: u32,
-    row_pitch: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -2564,6 +2612,15 @@ fn host_texture_as(
     // their unordered access views plain UNORM.
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
+    }
+    // Title-filled textures in sRGB-castable formats (BC1/BC2/BC3/BC7/RGBA8/BGRA8)
+    // are created typeless so shaders can sample them as either UNORM or UNORM_SRGB.
+    if d.flags & (TARGET | DEPTH) == 0
+        && clear.is_null()
+        && typeless_srgb_on()
+        && let Some(typeless) = srgb_castable_typeless(d.format)
+    {
+        d.format = typeless;
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
@@ -4688,5 +4745,42 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn bc7_and_srgb_formats_map_to_castable_typeless_and_concrete_copy() {
+        assert_eq!(srgb_castable_typeless(98), Some(97));
+        assert_eq!(srgb_castable_typeless(99), Some(97));
+        assert_eq!(srgb_castable_typeless(71), Some(70));
+        assert_eq!(srgb_castable_typeless(72), Some(70));
+        assert_eq!(srgb_castable_typeless(74), Some(73));
+        assert_eq!(srgb_castable_typeless(75), Some(73));
+        assert_eq!(srgb_castable_typeless(77), Some(76));
+        assert_eq!(srgb_castable_typeless(78), Some(76));
+        assert_eq!(srgb_castable_typeless(28), Some(27));
+        assert_eq!(srgb_castable_typeless(29), Some(27));
+        assert_eq!(srgb_castable_typeless(87), Some(90));
+        assert_eq!(srgb_castable_typeless(91), Some(90));
+        assert_eq!(srgb_castable_typeless(88), Some(92));
+        assert_eq!(srgb_castable_typeless(93), Some(92));
+        assert_eq!(srgb_castable_typeless(61), None);
+
+        assert_eq!(concrete_copy_format(97), 98);
+        assert_eq!(concrete_copy_format(70), 71);
+        assert_eq!(concrete_copy_format(27), 28);
+        assert_eq!(concrete_copy_format(98), 98);
+
+        // 16x16 BC7 (4x4 blocks = 64 bytes/row) repacks to 256-byte PC row pitch.
+        let fp = PlacedFootprint {
+            offset: 0,
+            format: 98,
+            width: 16,
+            height: 16,
+            depth: 1,
+            row_pitch: 64,
+        };
+        let (host_fp, [total, row_bytes, lines, src_pitch]) = fp.host_rows().unwrap();
+        assert_eq!(host_fp.row_pitch, 256);
+        assert_eq!((total, row_bytes, lines, src_pitch), (1024, 64, 4, 64));
     }
 }

@@ -72,6 +72,15 @@ pub(super) fn folder() -> Option<PathBuf> {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+
+/// Returns `(made, loaded, saved_bytes)` for the host pipeline library.
+pub fn stats() -> (u64, u64, u64) {
+    (
+        MADE.load(Ordering::Relaxed),
+        LOADED.load(Ordering::Relaxed),
+        SAVED.load(Ordering::Relaxed),
+    )
+}
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,

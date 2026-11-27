@@ -185,6 +185,17 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
+    /// Split exact UAV buffer copies written during the current `bind()` so
+    /// `flush_uav_writes()` can copy them back into their parent buffer before
+    /// vertex/index/SRV reads.
+    static EXACT_UAVS: std::cell::RefCell<
+        Vec<(
+            std::sync::Arc<crate::shadow::Shadow>,
+            std::sync::Arc<crate::shadow::Shadow>,
+            u64,
+            u64,
+        )>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -517,6 +528,17 @@ pub(crate) struct State {
     consts_gen: [u64; 2],
     last_bind: [Option<StaticBind>; 2],
     direct_cache: Option<Box<[(u64, u64, u64, u64); 512]>>,
+    /// A compute dispatch that can store to UAVs ran since the last UAV
+    /// barrier / graphics flush.
+    uav_written: bool,
+    /// Compute-written `exact` buffer UAVs that must be copied back to their
+    /// parent buffer before subsequent graphics draws or barriers read it.
+    exact_uavs: Vec<(
+        std::sync::Arc<crate::shadow::Shadow>,
+        std::sync::Arc<crate::shadow::Shadow>,
+        u64,
+        u64,
+    )>,
 }
 
 impl Drop for State {
@@ -1598,6 +1620,7 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        self.flush_uav_writes(list);
         if !self.bind(list, p, false) {
             return false;
         }
@@ -1781,6 +1804,9 @@ impl State {
                     TESTED_DEPTH.set((tested, cached.depth_read));
                     if cached.stores {
                         list.twins_written();
+                        if compute {
+                            self.uav_written = true;
+                        }
                     }
                     self.last_bind[c_idx] = Some(cached);
                     crate::port_static::note_bind_full();
@@ -1834,6 +1860,9 @@ impl State {
                     cached.consts_gen = self.consts_gen[c_idx];
                     if cached.stores {
                         list.twins_written();
+                        if compute {
+                            self.uav_written = true;
+                        }
                     }
                     self.last_bind[c_idx] = Some(cached);
                     crate::port_static::note_bind_const();
@@ -1867,11 +1896,14 @@ impl State {
         let mut cache_static = static_on && p.stages.len() <= 4;
         let mut cache_has_mem = false;
         let mut cache_has_amb = false;
+        let mut cache_has_uav = false;
         let mut cache_stores = false;
         let mut cache_depth_read = false;
+        EXACT_UAVS.with(|v| v.borrow_mut().clear());
         for stage in &p.stages {
             let t = stage.translated();
             cache_stores |= t.stores;
+            cache_has_uav |= !stage.root_uavs.is_empty() || t.tables.groups.iter().any(|g| g.has_uav);
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
@@ -2094,7 +2126,7 @@ impl State {
             }
             cache_depth_read |= TESTED_DEPTH.get().1;
         }
-        if static_on && p.stages.len() <= 4 && !cache_has_mem && !cache_has_amb {
+        if static_on && p.stages.len() <= 4 && !cache_has_mem && !cache_has_amb && !cache_has_uav {
             self.last_bind[c_idx] = Some(StaticBind {
                 pso_raw,
                 root_raw,
@@ -2115,6 +2147,12 @@ impl State {
         } else {
             self.last_bind[c_idx] = None;
         }
+        EXACT_UAVS.with(|v| {
+            let mut v = v.borrow_mut();
+            if !v.is_empty() {
+                self.exact_uavs.append(&mut v);
+            }
+        });
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
@@ -3170,10 +3208,14 @@ impl State {
             if let Some((param, word)) = compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X) {
                 // SAFETY: an open list; the root signature has the word.
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
+                self.last_bind[1] = None;
             }
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if p.stages.iter().any(|s| s.translated().stores || !s.root_uavs.is_empty()) {
+            self.uav_written = true;
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4419,6 +4461,88 @@ impl State {
         if self.batch.as_ref().is_some_and(|b| b.wrote) {
             self.batch = None;
         }
+        self.uav_written = false;
+    }
+
+    /// Like [`State::synced`], also flushing any split `exact` UAV writes back
+    /// to their parent buffer and emitting a UAV barrier if one has not already
+    /// been recorded by the caller.
+    pub(crate) fn synced_on(&mut self, list: &HostList, already_barriered: bool) {
+        self.synced();
+        if !self.exact_uavs.is_empty() {
+            self.flush_uav_writes(list);
+        } else if !already_barriered {
+            self.flush_uav_writes(list);
+        }
+    }
+
+    /// Ensures compute UAV writes are visible before subsequent graphics draws
+    /// (such as morph-target vertex buffers) or explicit barriers read them,
+    /// and copies any `exact`-split UAV buffers back into their parent buffer.
+    fn flush_uav_writes(&mut self, list: &HostList) {
+        let uav_barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        if !self.exact_uavs.is_empty() {
+            // SAFETY: an open list; global UAV barrier ensures compute writes
+            // into exact buffers have finished before we copy them back.
+            unsafe { list.list.barriers(&[uav_barrier]) };
+            let pending = std::mem::take(&mut self.exact_uavs);
+            let mut seen: Vec<(u64, u64, u64, u64)> = Vec::new();
+            for (home, parent, addr, len) in pending {
+                if len == 0 {
+                    continue;
+                }
+                let key = (home.id(), parent.id(), addr, len);
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                let src_off = home.buffer_offset();
+                let dst_off = parent.offset(addr);
+                if src_off + len <= home.width() && dst_off + len <= parent.width() {
+                    list.keep(&home.buffer);
+                    list.keep(&parent.buffer);
+                    // SAFETY: an open list; both buffers are kept alive and bounds checked.
+                    unsafe {
+                        list.list.CopyBufferRegion(
+                            &parent.buffer,
+                            dst_off,
+                            &home.buffer,
+                            src_off,
+                            len,
+                        );
+                    }
+                    parent.gpu_writes(list, addr, len);
+                }
+            }
+            let post_barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            // SAFETY: an open list; ensures CopyBufferRegion into parent completes
+            // before IASetVertexBuffers / SRVs read it.
+            unsafe { list.list.barriers(&[post_barrier]) };
+            self.uav_written = false;
+            return;
+        }
+        if self.uav_written {
+            // SAFETY: an open list; global UAV barrier orders prior compute UAV
+            // writes before vertex/index/SRV reads.
+            unsafe { list.list.barriers(&[uav_barrier]) };
+            self.uav_written = false;
+        }
     }
 
     /// Where the clamped record of `kind` at `arguments` of the copy `args`
@@ -4682,6 +4806,9 @@ impl State {
             self.mesh_scissor(list, false);
         }
         if kind == DISPATCH {
+            if p.stages.iter().any(|s| s.translated().stores || !s.root_uavs.is_empty()) {
+                self.uav_written = true;
+            }
             self.buffers_written();
         } else {
             self.drew(list, Some(p));
@@ -4896,7 +5023,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    if let Some((shadow, split_parent, address, len)) = crate::descriptor::host::buffer_copy_with_parent(view) {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
@@ -4905,6 +5032,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
                 shadow.gpu_writes(list, address, len);
+                if let Some(parent) = split_parent {
+                    EXACT_UAVS.with(|v| v.borrow_mut().push((shadow.clone(), parent, address, len)));
+                }
             } else {
                 #[cfg(feature = "diagnostics")]
                 {
@@ -5271,5 +5401,14 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+
+    #[test]
+    fn uav_written_tracks_compute_writes_until_synced() {
+        let mut s = super::State::default();
+        assert!(!s.uav_written);
+        s.uav_written = true;
+        s.synced();
+        assert!(!s.uav_written);
     }
 }

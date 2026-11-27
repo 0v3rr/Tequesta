@@ -1007,10 +1007,14 @@ void look() {
             let mut rows = vec![0u32; levels];
             let mut wide = vec![0u64; levels];
             let mut total = 0u64;
+            let mut fd = *desc;
+            fd.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
+                crate::resource::concrete_copy_format(desc.Format.0 as u32) as i32,
+            );
             // SAFETY: outputs for `levels` subresources.
             unsafe {
                 self.device.GetCopyableFootprints(
-                    desc,
+                    &fd,
                     0,
                     levels as u32,
                     0,

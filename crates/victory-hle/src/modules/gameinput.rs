@@ -85,7 +85,7 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
 /// mouse look (toggled with F2 or `` ` `` / `~`) plus I/J/K/L fallback;
 /// triggers come from LMB (RT) and RMB (LT). `Host::keys()` reports specific
 /// left/right modifiers (`0xA0..=0xA5`) rather than generic `0x10..=0x12`.
-const GTA_BUTTONS: [(u8, u32); 26] = [
+const GTA_BUTTONS: [(u8, u32); 25] = [
     (0x1B, MENU),           // Esc (also unlocks mouse look)
     (b'P', MENU),           // Pause / Map
     (b'V', VIEW),           // Change camera perspective
@@ -98,7 +98,7 @@ const GTA_BUTTONS: [(u8, u32); 26] = [
     (0x08, B),              // Backspace: Back / Cancel (menus)
     (b'F', Y),              // Enter / Exit vehicle
     (0x09, LEFT_SHOULDER),  // Tab: Weapon wheel (LB)
-    (b'Q', RIGHT_SHOULDER), // Q: Take cover / Handbrake (RB)
+    // Cover/handbrake (RB) uses scancode 0x10 (key left of Z/W) to avoid AZERTY Q strafe-left conflict
     (0xA2, LEFT_STICK),     // Left Ctrl: Crouch / Stealth / Horn (L3)
     (0xA3, LEFT_STICK),     // Right Ctrl: Crouch / Stealth / Horn (L3)
     (b'C', RIGHT_STICK),    // C: Look behind / Special (R3)

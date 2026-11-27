@@ -205,11 +205,19 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let mut rows = [(); 2]
                     .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
                 let mut bytes = [0u64; 2];
+                let mut fd_from = of_from;
+                fd_from.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
+                    crate::resource::concrete_copy_format(of_from.Format.0 as u32) as i32,
+                );
+                let mut fd_to = of_to;
+                fd_to.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
+                    crate::resource::concrete_copy_format(of_to.Format.0 as u32) as i32,
+                );
                 // SAFETY: plain queries; the out pointers are ours and
                 // hold `parts` layouts each.
                 unsafe {
                     host.device.GetCopyableFootprints(
-                        &of_from,
+                        &fd_from,
                         0,
                         parts,
                         0,
@@ -219,7 +227,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                         Some(&mut bytes[0]),
                     );
                     host.device.GetCopyableFootprints(
-                        &of_to,
+                        &fd_to,
                         0,
                         parts,
                         0,
@@ -1012,10 +1020,14 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     let count = u32::from(d.MipLevels) * layers;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut bytes = 0u64;
+    let mut fd = d;
+    fd.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
+        crate::resource::concrete_copy_format(d.Format.0 as u32) as i32,
+    );
     // SAFETY: outputs for `count` subresources.
     unsafe {
         host.device
-            .GetCopyableFootprints(&d, 0, count, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut bytes));
+            .GetCopyableFootprints(&fd, 0, count, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut bytes));
     }
     if bytes == 0 || bytes == u64::MAX {
         return;
@@ -1868,7 +1880,11 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let d = unsafe { texture.GetDesc() };
     let level0 = copy.base;
     let mips = level0 + u32::from(d.MipLevels);
-    let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
+    let first = if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D && d.DepthOrArraySize > 1 {
+        level0
+    } else {
+        crate::resource::read_from(&layout, first).max(level0).min(mips - 1)
+    };
     let read = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         mips - first
@@ -1878,10 +1894,14 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
+    let mut fd = d;
+    fd.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
+        crate::resource::concrete_copy_format(d.Format.0 as u32) as i32,
+    );
     // SAFETY: outputs for `count` subresources.
     unsafe {
         host.device.GetCopyableFootprints(
-            &d,
+            &fd,
             first - level0,
             count,
             0,

@@ -93,6 +93,38 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Pre-compiles a standalone compute shader container into the active
+/// `ID3D12PipelineLibrary1` cache.
+pub fn precompile_compute_pso(container: &[u8]) -> bool {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::precompile_compute_pso(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        false
+    }
+}
+
+/// Saves the `ID3D12PipelineLibrary1` cache to disk now.
+pub fn save_pipeline_cache() {
+    #[cfg(windows)]
+    victory_gpu::pipeline::save_pipeline_cache();
+}
+
+/// Returns `(made, loaded, saved_bytes)` for the host pipeline library.
+pub fn pipeline_cache_stats() -> (u64, u64, u64) {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::pipeline_cache_stats()
+    }
+    #[cfg(not(windows))]
+    {
+        (0, 0, 0)
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

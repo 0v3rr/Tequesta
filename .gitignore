@@ -13,6 +13,19 @@
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
+tequesta_config.toml
+perf_trace.log
+
+# Generated pipeline library & shader caches
+*.pipelib
+host-pipelines.bin
+host-pipelines.next
+host-pipelines.tmp
+early-pipelines.txt
+slow-pipelines.txt
+known-shaders.bin
+known-pipelines.bin
+warm-bad.txt
 
 # Places people tend to drop data into. Keep data outside the repo instead.
 /game/

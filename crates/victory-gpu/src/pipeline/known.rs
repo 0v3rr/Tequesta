@@ -358,6 +358,71 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     }
 }
 
+/// Pre-compiles every known pipeline in `dir` (`known-pipelines.bin` /
+/// `known-shaders.bin`) across `jobs` threads so they are stored into the
+/// active `ID3D12PipelineLibrary1` cache. Returns `(succeeded, skipped_bad, failed)`.
+pub fn precompile_into_library(dir: &Path, jobs: usize) -> (usize, usize, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let all_keys = keys(dir);
+    if all_keys.is_empty() {
+        return (0, 0, 0);
+    }
+    let bad = if bad_list_disabled() {
+        HashSet::new()
+    } else {
+        let text = std::fs::read_to_string(dir.join(WARM_BAD_FILE)).unwrap_or_default();
+        parse_bad_keys(&text, &fingerprint())
+    };
+    let mut places = HashMap::new();
+    walk_shaders(dir, |stage, hash, at, len| {
+        let _ = places.insert(hash, (stage, at, len));
+    });
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut skipped_bad = 0usize;
+    walk_pipelines(dir, |n, bytes| {
+        if all_keys.get(n).is_some_and(|k| bad.contains(k)) {
+            skipped_bad += 1;
+        } else {
+            entries.push(bytes.to_vec());
+        }
+    });
+    if entries.is_empty() {
+        return (0, skipped_bad, 0);
+    }
+    let threads = jobs.max(1).min(entries.len());
+    let next = AtomicUsize::new(0);
+    let ok = AtomicUsize::new(0);
+    let fail = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else {
+                    return;
+                };
+                let mut read = |hash: &[u8; 32]| {
+                    let &(_, at, len) = places.get(hash)?;
+                    let mut bytes = vec![0; len as usize];
+                    file.seek(SeekFrom::Start(at)).ok()?;
+                    file.read_exact(&mut bytes).ok()?;
+                    Some(bytes)
+                };
+                while let Some(entry) = entries.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let made = parse(entry, &mut read)
+                        .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
+                        .is_some();
+                    if made {
+                        ok.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        fail.fetch_add(1, Ordering::Relaxed);
+                    }
+                    super::library::save(false);
+                }
+            });
+        }
+    });
+    (ok.load(Ordering::Relaxed), skipped_bad, fail.load(Ordering::Relaxed))
+}
+
 #[allow(clippy::type_complexity)]
 fn parse(
     entry: &[u8],
