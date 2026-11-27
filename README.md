@@ -43,3 +43,53 @@ Unlike traditional CPU emulators, x86-64 game instructions execute natively on t
 - Windows 10/11 (x64) with a DirectX 12 capable GPU (tested on **NVIDIA RTX A4500**)
 - Rust toolchain (`stable-x86_64-pc-windows-msvc`) & Visual Studio C++ Build Tools
 - Legally obtained/local Xbox Series build files (no game files, keys, or precompiled binaries are included in this repository)
+
+## Controls & Hotkeys (`VICTORY_KBM_NATIVE=1`)
+
+Tequesta translates native Windows `WM_INPUT` raw mouse movement and layout-independent keyboard scancodes (supporting both **QWERTY** and **AZERTY** layouts out of the box):
+
+| Action | Keyboard / Mouse Input | Xbox Series Equivalent |
+| :--- | :--- | :--- |
+| **Open / Close Overlay Menu** | `F1` | Releases mouse cursor & opens `tequesta_ui` |
+| **Toggle Mouse Camera Capture** | `F2` or `~` | Enables/releases raw `WM_INPUT` camera look |
+| **Move** | `W` `A` `S` `D` (QWERTY) / `Z` `Q` `S` `D` (AZERTY) | Left Stick |
+| **Camera Look** | Mouse Movement | Right Stick |
+| **Fire / Attack / Accelerate** | Left Mouse Click | `RT` |
+| **Aim / Brake / Reverse** | Right Mouse Click | `LT` |
+| **Look Behind / Special** | Middle Mouse Click | `R3` |
+| **Sprint** | `Shift` | `A` |
+| **Jump / Climb** | `Space` | `X` |
+| **Reload / Melee** | `R` | `B` |
+| **Enter / Exit Vehicle** | `F` | `Y` |
+| **Interact** | `E` | D-Pad Right |
+| **Cover / Handbrake** | `Q` (QWERTY) / `A` (AZERTY) | `RB` |
+| **Weapon Wheel** | `Tab` | `LB` |
+| **Crouch / Stealth** | `Ctrl` | `L3` |
+| **Pause Menu** | `Esc` or `P` | Menu (also frees mouse cursor) |
+
+## Configuration & Environment Variables
+
+### In-Game Overlay Menu (`F1`) & `tequesta_config.toml`
+Pressing `F1` opens the native D3D12 settings overlay (`tequesta_ui.rs`). Changes are persisted in `tequesta_config.toml`:
+
+* **Live Settings (applied immediately without restart):**
+  * `VICTORY_PORT_STATIC`: Toggle static command-list & descriptor table caching (`ON` / `OFF`)
+  * `FPS Cap`: `Unlimited` / `30 FPS` / `60 FPS`
+  * `Mouse Sensitivity`: `0.25x` to `3.00x`
+  * `FPS / Frame-Time HUD`: Compact top-right performance overlay (`ON` / `OFF`)
+* **Restart-Applied Settings (saved via *Apply & Restart*):**
+  * `Resolution Scale`: `50%` / `75%` / `100%`
+  * `Display Mode`: `Windowed` / `Borderless Fullscreen`
+  * `VICTORY_RAW_VIEWS`: Toggle raw committed resources vs `ExactArenaPool` (`OFF` / `ON`)
+  * `Native Keyboard / Mouse`: Toggle `VICTORY_KBM_NATIVE` (`ON` / `OFF`)
+
+### Recommended Launch Environment Flags (NVIDIA RTX)
+
+| Variable | Recommended | Purpose |
+| :--- | :---: | :--- |
+| `VICTORY_PORT_STATIC` | `1` | Enables static draw-state memoization and 512-entry direct descriptor table caching |
+| `VICTORY_THIN` | `1` | Merges contiguous `ExecuteIndirect` calls sharing the same signature/buffer |
+| `VICTORY_JOIN_PARTS` | `8` | Parallel command list translation worker count |
+| `VICTORY_CARD_REHASH_RUNS` | `1` | Batches unified GPU memory card-table rehashes |
+| `VICTORY_KBM_NATIVE` | `1` | Enables native `WM_INPUT` raw mouse and scancode keyboard input |
+| `VICTORY_RAW_VIEWS` | `0` | Keeps 4 MiB `ExactArenaPool` sub-allocation active (essential for NVIDIA drivers) |
