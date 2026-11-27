@@ -3945,21 +3945,26 @@ fn default_typed_uav_desc(
 }
 
 /// Clamps UAV mip and array/depth slice indices to the host texture's bounds.
+/// Returns `false` if the texture is multisampled or the UAV dimension does not
+/// match the resource dimension.
 fn clamp_uav_subresource(
     texture: &ID3D12Resource,
     desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC,
-) {
+) -> bool {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    if d.SampleDesc.Count > 1 {
+        return false;
+    }
     let max_mip = u32::from(d.MipLevels).saturating_sub(1);
     let max_slices = u32::from(d.DepthOrArraySize).max(1);
-    match desc.ViewDimension {
-        D3D12_UAV_DIMENSION_TEXTURE1D => {
+    match (d.Dimension, desc.ViewDimension) {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_UAV_DIMENSION_TEXTURE1D) => {
             // SAFETY: active union variant matches `ViewDimension`.
             let t = unsafe { &mut desc.Anonymous.Texture1D };
             t.MipSlice = t.MipSlice.min(max_mip);
         }
-        D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
             // SAFETY: active union variant matches `ViewDimension`.
             let t = unsafe { &mut desc.Anonymous.Texture1DArray };
             t.MipSlice = t.MipSlice.min(max_mip);
@@ -3969,12 +3974,12 @@ fn clamp_uav_subresource(
                 t.ArraySize = avail;
             }
         }
-        D3D12_UAV_DIMENSION_TEXTURE2D => {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2D) => {
             // SAFETY: active union variant matches `ViewDimension`.
             let t = unsafe { &mut desc.Anonymous.Texture2D };
             t.MipSlice = t.MipSlice.min(max_mip);
         }
-        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => {
             // SAFETY: active union variant matches `ViewDimension`.
             let t = unsafe { &mut desc.Anonymous.Texture2DArray };
             t.MipSlice = t.MipSlice.min(max_mip);
@@ -3984,7 +3989,7 @@ fn clamp_uav_subresource(
                 t.ArraySize = avail;
             }
         }
-        D3D12_UAV_DIMENSION_TEXTURE3D => {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_UAV_DIMENSION_TEXTURE3D) => {
             // SAFETY: active union variant matches `ViewDimension`.
             let t = unsafe { &mut desc.Anonymous.Texture3D };
             t.MipSlice = t.MipSlice.min(max_mip);
@@ -3995,8 +4000,9 @@ fn clamp_uav_subresource(
                 t.WSize = avail;
             }
         }
-        _ => {}
+        _ => return false,
     }
+    true
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -4578,13 +4584,18 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     // Every family has more than one format, its typeless one first.
     let typeless = family(own) == own && family(own + 1) == own;
-    if let Some(format) = format.as_deref_mut()
-        && unordered
-        && let Some(&(_, linear)) = crate::resource::SRGB
-            .iter()
-            .find(|&&(s, _)| s == format.0 as u32)
-    {
-        format.0 = linear as i32;
+    if let Some(format) = format.as_deref_mut() {
+        let f = format.0 as u32;
+        if f != 0 && family(f) == f && family(f + 1) == f {
+            format.0 = crate::resource::concrete_copy_format(f) as i32;
+        }
+        if unordered
+            && let Some(&(_, linear)) = crate::resource::SRGB
+                .iter()
+                .find(|&&(s, _)| s == format.0 as u32)
+        {
+            format.0 = linear as i32;
+        }
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
@@ -4933,7 +4944,9 @@ fn make_twinned(
                         {
                             d.Format = DXGI_FORMAT(own_fmt as i32);
                         }
-                        clamp_uav_subresource(texture, d);
+                        if !clamp_uav_subresource(texture, d) {
+                            return None;
+                        }
                     } else if let Some(own_fmt) = crate::resource::view_format(resource) {
                         desc = default_typed_uav_desc(texture, own_fmt);
                     }

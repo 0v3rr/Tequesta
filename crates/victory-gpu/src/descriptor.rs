@@ -991,8 +991,19 @@ impl RtvRecord {
                 0,
             ]
         };
+        let mut fmt = crate::resource::pc_format(words[0]);
+        let is_typeless = fmt != 0
+            && crate::resource::family(fmt) == fmt
+            && crate::resource::family(fmt + 1) == fmt;
+        if fmt == 0 || is_typeless {
+            if let Some(view_fmt) = crate::resource::view_format(self.resource) {
+                fmt = view_fmt;
+            } else if is_typeless {
+                fmt = crate::resource::concrete_copy_format(fmt);
+            }
+        }
         // A target or depth view: of a target, in its stand-in format.
-        words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
+        words[0] = crate::resource::target_format(fmt);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }

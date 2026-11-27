@@ -1432,7 +1432,7 @@ pub(crate) struct HostList {
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    prelude: Mutex<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -4592,10 +4592,11 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude(list_type));
-            }
+            let prelude = Mutex::new(if !lazy_prelude() {
+                self.make_prelude(list_type)
+            } else {
+                None
+            });
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
             let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
@@ -6171,11 +6172,9 @@ impl Host {
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let is_compute_sub = self.compute_queue.is_some()
-            && runs.len() > usize::from(own.is_some())
-            && runs[usize::from(own.is_some())..].iter().all(|r| r.is_compute());
         let mut direct_handoffs: Vec<Prelude> = Vec::new();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut list_is_compute: Vec<bool> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         // Diagnostics: where each list of `lists` starts and what it is, for
@@ -6259,13 +6258,23 @@ impl Host {
                 continue;
             }
             let p_out = list.prelude(&uploads, this_submission);
-            if let Some(prelude) = p_out.list {
+            if list.is_poisoned() {
+                continue;
+            }
+            if let Some(h) = p_out.direct_handoff {
+                let cmd: Option<ID3D12CommandList> = h.1.cast().ok();
+                if cmd.is_some() {
+                    #[cfg(feature = "diagnostics")]
+                    marks.push((lists.len(), crate::copystat::Timed::Prelude));
+                    lists.push(cmd);
+                    list_is_compute.push(false);
+                }
+                direct_handoffs.push(h);
+            } else if let Some(prelude) = p_out.list {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
-            }
-            if let Some(h) = p_out.direct_handoff {
-                direct_handoffs.push(h);
+                list_is_compute.push(list.is_compute());
             }
             #[cfg(feature = "diagnostics")]
             marks.push((
@@ -6276,7 +6285,9 @@ impl Host {
                 },
             ));
             lists.push(list.list.cast().ok());
+            list_is_compute.push(list.is_compute());
         }
+        let has_compute = self.compute_queue.is_some() && list_is_compute.iter().any(|&c| c);
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush();
@@ -6328,12 +6339,13 @@ impl Host {
         }
         let mut card_check: Option<ID3D12CommandList> = None;
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            if is_compute_sub {
+            if has_compute {
                 card_check = Some(check);
             } else {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Compare));
                 lists.push(Some(check));
+                list_is_compute.push(false);
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -6354,14 +6366,16 @@ impl Host {
         stage.next("submit: sending");
         // When it runs on the card, for the timeline.
         #[cfg(feature = "diagnostics")]
-        let stamp = (!is_compute_sub).then(stamps::take).flatten();
+        let stamp = (!has_compute).then(stamps::take).flatten();
         #[cfg(feature = "diagnostics")]
-        if !is_compute_sub && let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
+        if !has_compute && let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
             lists.insert(0, Some(ahead));
+            list_is_compute.insert(0, false);
             marks.iter_mut().for_each(|m| m.0 += 1);
             marks.insert(0, (0, crate::copystat::Timed::Other));
             marks.push((lists.len(), crate::copystat::Timed::Other));
             lists.push(Some(behind));
+            list_is_compute.push(false);
             firsts.iter_mut().for_each(|first| *first += 1);
         }
         #[cfg(feature = "diagnostics")]
@@ -6369,64 +6383,76 @@ impl Host {
         if late {
             let mut sent_handoffs: Vec<Prelude> = Vec::new();
             let card_synced = card.as_ref().is_some_and(|c| !c.lists.is_empty());
-            let compute_fence_val = if is_compute_sub {
+            let compute_fence_val = if has_compute {
                 let compute_queue = self.compute_queue.as_ref().unwrap();
                 let compute_fence = self.compute_fence.as_ref().unwrap();
-                let compute_start = if own.is_some() { firsts[1] } else { 0 };
-                let mut direct_lists: Vec<Option<ID3D12CommandList>> = lists[..compute_start].to_vec();
-                for (_, list) in &direct_handoffs {
-                    direct_lists.push(list.cast().ok());
-                }
                 sent_handoffs = direct_handoffs;
-                if !direct_lists.is_empty() || card_synced {
-                    *submitted += 1;
-                    // SAFETY: closed direct lists; the fence is ours.
-                    let direct_sig = unsafe {
-                        if !direct_lists.is_empty() {
-                            self.wait_compute_on_direct()
-                                .and_then(|()| {
-                                    self.queue.ExecuteCommandLists(&direct_lists);
-                                    self.queue.Signal(&self.fence, *submitted)
-                                })
-                        } else {
-                            self.queue.Signal(&self.fence, *submitted)
-                        }
-                    };
-                    if let Err(e) = direct_sig {
-                        fail(format_args!("direct handoff before compute submission failed ({e})"));
+                let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+                let mut is_cut = vec![false; lists.len() + 1];
+                for c in cuts {
+                    if c < is_cut.len() {
+                        is_cut[c] = true;
                     }
                 }
                 let exec_t0 = trace_frame_on().then(std::time::Instant::now);
-                let c_val = {
-                    let mut c_sub = self.compute_submitted.lock().unwrap_or_else(|e| e.into_inner());
-                    *c_sub += 1;
-                    *c_sub
-                };
-                let cuts: Vec<usize> = parts
-                    .iter()
-                    .filter_map(|&n| firsts.get(n).copied())
-                    .filter(|&idx| idx >= compute_start)
-                    .map(|idx| idx - compute_start)
-                    .collect();
-                let compute_lists = &lists[compute_start..];
-                // SAFETY: closed compute lists; `self.fence` and `compute_fence` are ours.
-                let signalled = unsafe {
-                    let wait_res = if *submitted > 0 {
-                        compute_queue.Wait(&self.fence, *submitted)
-                    } else {
-                        Ok(())
-                    };
-                    wait_res.and_then(|()| {
-                        let mut from = 0;
-                        for to in cuts.into_iter().chain([compute_lists.len()]) {
-                            if from < to {
-                                compute_queue.ExecuteCommandLists(&compute_lists[from..to]);
-                            }
-                            from = to;
+                let mut last_c_val = 0u64;
+                let mut direct_ran = false;
+                let mut idx = 0;
+                while idx < lists.len() {
+                    let seg_compute = list_is_compute[idx];
+                    let start = idx;
+                    idx += 1;
+                    while idx < lists.len() && list_is_compute[idx] == seg_compute && !is_cut[idx] {
+                        idx += 1;
+                    }
+                    let seg = &lists[start..idx];
+                    if seg_compute {
+                        let c_val = {
+                            let mut c_sub = self.compute_submitted.lock().unwrap_or_else(|e| e.into_inner());
+                            *c_sub += 1;
+                            *c_sub
+                        };
+                        // SAFETY: closed compute lists; fences are ours.
+                        let res = unsafe {
+                            let wait_res = if *submitted > 0 {
+                                compute_queue.Wait(&self.fence, *submitted)
+                            } else {
+                                Ok(())
+                            };
+                            wait_res.and_then(|()| {
+                                compute_queue.ExecuteCommandLists(seg);
+                                compute_queue.Signal(compute_fence, c_val)
+                            })
+                        };
+                        if let Err(e) = res {
+                            fail(format_args!("a compute submission sent ahead could not be followed by a signal ({e})"));
                         }
-                        compute_queue.Signal(compute_fence, c_val)
-                    })
-                };
+                        last_c_val = c_val;
+                    } else {
+                        *submitted += 1;
+                        direct_ran = true;
+                        // SAFETY: closed direct lists; fences are ours.
+                        let res = unsafe {
+                            self.wait_compute_on_direct().and_then(|()| {
+                                if last_c_val > 0 {
+                                    self.queue.Wait(compute_fence, last_c_val)?;
+                                }
+                                self.queue.ExecuteCommandLists(seg);
+                                self.queue.Signal(&self.fence, *submitted)
+                            })
+                        };
+                        if let Err(e) = res {
+                            fail(format_args!("direct handoff before compute submission failed ({e})"));
+                        }
+                    }
+                }
+                if !direct_ran && card_synced {
+                    *submitted += 1;
+                    // SAFETY: `self.fence` is ours.
+                    if let Err(e) = unsafe { self.queue.Signal(&self.fence, *submitted) } {
+                        fail(format_args!("direct card sync signal failed ({e})"));
+                    }
+                }
                 if let Some(t0) = exec_t0 {
                     SUBMIT_PARTS_US[4].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
@@ -6435,27 +6461,27 @@ impl Host {
                 crate::timeline::sent(sending, *submitted, stamp);
                 self.card_sent();
                 stage.next("submit: noting what is in the air");
-                if let Err(e) = signalled {
-                    fail(format_args!("a compute submission sent ahead could not be followed by a signal ({e})"));
-                }
                 if let Some(check) = card_check {
                     *submitted += 1;
                     // SAFETY: closed direct compare list; fences are ours.
                     let check_sig = unsafe {
-                        self.queue
-                            .Wait(compute_fence, c_val)
-                            .and_then(|()| {
-                                self.queue.ExecuteCommandLists(&[Some(check)]);
-                                self.queue.Signal(&self.fence, *submitted)
-                            })
+                        let wait_res = if last_c_val > 0 {
+                            self.queue.Wait(compute_fence, last_c_val)
+                        } else {
+                            Ok(())
+                        };
+                        wait_res.and_then(|()| {
+                            self.queue.ExecuteCommandLists(&[Some(check)]);
+                            self.queue.Signal(&self.fence, *submitted)
+                        })
                     };
                     if let Err(e) = check_sig {
                         fail(format_args!("card compare after compute submission failed ({e})"));
                     }
-                } else {
-                    self.pending_compute_wait.fetch_max(c_val, Ordering::AcqRel);
+                } else if last_c_val > 0 {
+                    self.pending_compute_wait.fetch_max(last_c_val, Ordering::AcqRel);
                 }
-                c_val
+                last_c_val
             } else {
                 *submitted += 1;
                 #[cfg(feature = "diagnostics")]
@@ -6522,7 +6548,7 @@ impl Host {
         // (Each list on its own: a run's prelude, which brings its copies up
         // to date, apart from the run's commands; the compare apart from the
         // last run.)
-        let groups: Vec<(&[Option<ID3D12CommandList>], crate::copystat::Timed)> = if !is_compute_sub && timing() {
+        let groups: Vec<(&[Option<ID3D12CommandList>], crate::copystat::Timed)> = if !has_compute && timing() {
             marks
                 .iter()
                 .zip(marks.iter().skip(1).map(|m| m.0).chain([lists.len()]))
@@ -6535,52 +6561,73 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
         submitting(2, runs.len());
-        if is_compute_sub {
+        if has_compute {
             let compute_queue = self.compute_queue.as_ref().unwrap();
             let compute_fence = self.compute_fence.as_ref().unwrap();
-            let compute_start = if own.is_some() { firsts[1] } else { 0 };
             let card_synced = card.as_ref().is_some_and(|c| !c.lists.is_empty());
-            let mut direct_lists: Vec<Option<ID3D12CommandList>> = lists[..compute_start].to_vec();
-            for (_, list) in &direct_handoffs {
-                direct_lists.push(list.cast().ok());
-            }
-            if !direct_lists.is_empty() || card_synced {
-                *submitted += 1;
-                // SAFETY: closed direct lists; fences are ours.
-                if let Err(e) = unsafe {
-                    if !direct_lists.is_empty() {
+            let mut last_c_val = 0u64;
+            let mut last_was_direct = false;
+            let mut idx = 0;
+            while idx < lists.len() {
+                let seg_compute = list_is_compute[idx];
+                let start = idx;
+                idx += 1;
+                while idx < lists.len() && list_is_compute[idx] == seg_compute {
+                    idx += 1;
+                }
+                let seg = &lists[start..idx];
+                if seg_compute {
+                    last_was_direct = false;
+                    if *submitted > 0 {
+                        // SAFETY: `self.fence` is ours; `submitted` was signalled above.
+                        if let Err(e) = unsafe { compute_queue.Wait(&self.fence, *submitted) } {
+                            tracing::warn!(error = %e, "compute wait before synchronous compute failed");
+                        }
+                    }
+                    let c_val = {
+                        let mut c_sub = self.compute_submitted.lock().unwrap_or_else(|e| e.into_inner());
+                        *c_sub += 1;
+                        *c_sub
+                    };
+                    // SAFETY: closed compute lists; compute fence is ours.
+                    unsafe {
+                        compute_queue.ExecuteCommandLists(seg);
+                        if let Err(e) = compute_queue.Signal(compute_fence, c_val) {
+                            tracing::warn!(error = %e, "compute signal failed");
+                        }
+                    }
+                    last_c_val = c_val;
+                } else {
+                    *submitted += 1;
+                    last_was_direct = true;
+                    // SAFETY: closed direct lists; fences are ours.
+                    if let Err(e) = unsafe {
                         self.wait_compute_on_direct().and_then(|()| {
-                            self.queue.ExecuteCommandLists(&direct_lists);
+                            if last_c_val > 0 {
+                                self.queue.Wait(compute_fence, last_c_val)?;
+                            }
+                            self.queue.ExecuteCommandLists(seg);
                             self.queue.Signal(&self.fence, *submitted)
                         })
-                    } else {
-                        self.queue.Signal(&self.fence, *submitted)
+                    } {
+                        tracing::warn!(error = %e, "direct handoff before synchronous compute failed");
                     }
-                } {
-                    tracing::warn!(error = %e, "direct handoff before synchronous compute failed");
                 }
             }
-            if *submitted > 0 {
-                // SAFETY: `self.fence` is ours; `submitted` was signalled above.
-                if let Err(e) = unsafe { compute_queue.Wait(&self.fence, *submitted) } {
-                    tracing::warn!(error = %e, "compute wait before synchronous compute failed");
+            if last_was_direct && card_synced {
+                // Already signalled `*submitted` on `self.queue`.
+            } else if card_synced {
+                *submitted += 1;
+                // SAFETY: `self.fence` is ours.
+                if let Err(e) = unsafe { self.queue.Signal(&self.fence, *submitted) } {
+                    tracing::warn!(error = %e, "direct card sync signal failed");
                 }
             }
-            let c_val = {
-                let mut c_sub = self.compute_submitted.lock().unwrap_or_else(|e| e.into_inner());
-                *c_sub += 1;
-                *c_sub
-            };
+            self.card_sent();
             let started = std::time::Instant::now();
-            // SAFETY: closed compute lists; compute fence and event are ours.
-            unsafe {
-                if compute_start < lists.len() {
-                    compute_queue.ExecuteCommandLists(&lists[compute_start..]);
-                }
-                self.card_sent();
-                let waited = compute_queue
-                    .Signal(compute_fence, c_val)
-                    .and_then(|()| compute_fence.SetEventOnCompletion(c_val, self.compute_event));
+            if last_c_val > 0 {
+                // SAFETY: `compute_fence` is ours; `last_c_val` was signalled above.
+                let waited = unsafe { compute_fence.SetEventOnCompletion(last_c_val, self.compute_event) };
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
                 match waited {
@@ -6588,11 +6635,19 @@ impl Host {
                         working(false);
                         #[cfg(feature = "diagnostics")]
                         let _card = crate::timeline::card_wait(Some(*submitted));
-                        WaitForSingleObject(self.compute_event, INFINITE);
+                        // SAFETY: `self.compute_event` is a valid event handle.
+                        unsafe { WaitForSingleObject(self.compute_event, INFINITE) };
                         stood(started);
                         working(true);
                     }
                     Err(e) => tracing::warn!(error = %e, "host compute submission not waited for"),
+                }
+            }
+            if last_was_direct && *submitted > 0 {
+                // SAFETY: `self.fence` is ours; `*submitted` was signalled above.
+                if let Ok(()) = unsafe { self.fence.SetEventOnCompletion(*submitted, self.event) } {
+                    // SAFETY: `self.event` is a valid event handle.
+                    unsafe { WaitForSingleObject(self.event, INFINITE) };
                 }
             }
             self.pending_compute_wait.store(0, Ordering::Release);
@@ -7593,8 +7648,10 @@ impl HostList {
             };
         }
         // The copies (depth texture, twin, whether into the twin); the
-        // sides are then as this list leaves them.
+        // sides are then as this list leaves them (committed once the prelude
+        // succeeds).
         let mut syncs = Vec::new();
+        let mut twin_commits = Vec::with_capacity(twins.len());
         for u in twins.values() {
             let real = u.twin.behind.load(Ordering::Relaxed);
             let mut behind = [real & 1 != 0, real & 2 != 0];
@@ -7606,7 +7663,7 @@ impl HostList {
             }
             let left = [0, 1].map(|side| u.behind[side].unwrap_or(behind[side]));
             let left = u32::from(left[0]) | (u32::from(left[1]) << 1);
-            u.twin.behind.store(left, Ordering::Relaxed);
+            twin_commits.push((u.twin.clone(), left));
         }
         drop(twins);
         // A copy runs with its textures in the copy states: each moves
@@ -7679,13 +7736,22 @@ impl HostList {
                 copying.insert(key, COPY_DEST);
             }
         }
-        barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
-            let real = copy.state.swap(*last, Ordering::Relaxed);
+        barriers.extend(states.iter().filter_map(|(key, (first, _last, copy))| {
+            let real = copy.state.load(Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
+        let commit_states = || {
+            for (twin, left) in &twin_commits {
+                twin.behind.store(*left, Ordering::Relaxed);
+            }
+            for (_key, (_first, last, copy)) in states.iter() {
+                copy.state.store(*last, Ordering::Relaxed);
+            }
+        };
         if aliasing.is_empty() && to_copy.is_empty() && barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
+            commit_states();
             return PreludeOut {
                 list: None,
                 direct_handoff: None,
@@ -7703,65 +7769,101 @@ impl HostList {
             && (!syncs.is_empty()
                 || !uploads.is_empty()
                 || to_copy.iter().chain(&barriers).any(has_graphics_state));
-        let mut handoff = if needs_direct {
-            let Some(h) = host().and_then(|h| h.take_compute_handoff()) else {
-                fail(format_args!("no host list for a state prelude"));
-            };
-            Some(h)
-        } else {
-            None
-        };
         let list_type = self.list_type;
-        let (allocator, list) = if let Some((allocator, list)) = handoff.as_ref() {
-            (allocator, list)
-        } else {
-            let Some((allocator, list)) = self
-                .prelude
-                .get_or_init(|| host().and_then(|h| h.make_prelude(list_type)))
-                .as_ref()
-            else {
-                fail(format_args!("no host list for a state prelude"));
+        let record_prelude = |allocator: &ID3D12CommandAllocator, list: &ID3D12GraphicsCommandList| {
+            // SAFETY: the prelude is not executing (every submission is waited
+            // for); the textures are live.
+            unsafe {
+                allocator.Reset().and_then(|()| {
+                    list.Reset(allocator, None)?;
+                    if !aliasing.is_empty() {
+                        list.ResourceBarrier(&aliasing);
+                    }
+                    if !to_copy.is_empty() {
+                        list.ResourceBarrier(&to_copy);
+                    }
+                    for (depth, twin, colour) in &syncs {
+                        record_twin_copy(list, &depth.texture, twin, *colour);
+                    }
+                    for (upload, _) in uploads {
+                        upload.staging.record_detile(list, submission);
+                    }
+                    for (upload, _) in uploads {
+                        upload.record(self, list);
+                    }
+                    if !barriers.is_empty() {
+                        list.ResourceBarrier(&barriers);
+                    }
+                    list.Close()
+                })
+            }
+        };
+        let log_prelude_failure = |reason: &str, err: Option<windows::core::Error>| {
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                // SAFETY: plain query.
+                let removed = host().map(|h| unsafe { h.device.GetDeviceRemovedReason() });
+                tracing::error!(
+                    reason,
+                    ?err,
+                    ?removed,
+                    list_type = list_type.0,
+                    needs_direct,
+                    states = states.len(),
+                    uploads = uploads.len(),
+                    syncs = syncs.len(),
+                    "state prelude failed; poisoning list to avoid crash"
+                );
+            }
+        };
+        if needs_direct {
+            let Some(h) = host().and_then(|h| h.take_compute_handoff()) else {
+                log_prelude_failure("no host list for a direct handoff state prelude", None);
+                self.poisoned.store(true, Ordering::Release);
+                return PreludeOut {
+                    list: None,
+                    direct_handoff: None,
+                };
             };
-            (allocator, list)
-        };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                if !aliasing.is_empty() {
-                    list.ResourceBarrier(&aliasing);
-                }
-                if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
-                }
-                for (depth, twin, colour) in &syncs {
-                    record_twin_copy(list, &depth.texture, twin, *colour);
-                }
-                for (upload, _) in uploads {
-                    upload.staging.record_detile(list, submission);
-                }
-                for (upload, _) in uploads {
-                    upload.record(self, list);
-                }
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
-                }
-                list.Close()
-            })
-        };
-        if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
-        }
-        let cast_list = list.cast().ok();
-        if let Some(h) = handoff.take() {
+            if let Err(e) = record_prelude(&h.0, &h.1) {
+                log_prelude_failure("a direct handoff state prelude did not record", Some(e));
+                self.poisoned.store(true, Ordering::Release);
+                return PreludeOut {
+                    list: None,
+                    direct_handoff: None,
+                };
+            }
+            commit_states();
             PreludeOut {
                 list: None,
                 direct_handoff: Some(h),
             }
         } else {
+            let mut guard = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = host().and_then(|h| h.make_prelude(list_type));
+            }
+            let Some((allocator, list)) = guard.as_ref() else {
+                log_prelude_failure("no host list for a state prelude", None);
+                self.poisoned.store(true, Ordering::Release);
+                return PreludeOut {
+                    list: None,
+                    direct_handoff: None,
+                };
+            };
+            if let Err(e) = record_prelude(allocator, list) {
+                log_prelude_failure("a host state prelude did not record", Some(e));
+                *guard = None;
+                self.poisoned.store(true, Ordering::Release);
+                return PreludeOut {
+                    list: None,
+                    direct_handoff: None,
+                };
+            }
+            commit_states();
             PreludeOut {
-                list: cast_list,
+                list: list.cast().ok(),
                 direct_handoff: None,
             }
         }

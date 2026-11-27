@@ -1475,7 +1475,20 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
+            let resolved_fmt = if crate::resource::stands_in(dst) {
+                a.Format.0 as u32
+            } else {
+                let f = crate::resource::pc_format(format);
+                let is_typeless = f != 0
+                    && crate::resource::family(f) == f
+                    && crate::resource::family(f + 1) == f;
+                if f == 0 || is_typeless {
+                    crate::resource::concrete_copy_format(a.Format.0 as u32)
+                } else {
+                    f
+                }
+            };
+            let format = DXGI_FORMAT(resolved_fmt as i32);
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
