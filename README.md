@@ -15,6 +15,7 @@ Tested on **Windows 10/11 (x64)** with an **NVIDIA RTX A4500 (20 GB VRAM)**:
 | **Executable Load & Boot** | Working | Native x86-64 PE/XEX mapping with TLS redirection and GDK/Scarlett HLE |
 | **Main Menu** | Working | Full 2D/UI rendering at **30 FPS** |
 | **In-Game 3D World** | Working | Boots into Lucia's opening prologue (café cutscene & prison cell) |
+| **Playable & Controls** | Working | Full character movement in the prison and subsequent scenes with working HUD, pause menu, and keyboard/mouse input (VICTORY_KBM_GTA=1) |
 | **In-Game Frame Rate** | **6–12 FPS** | Measured in active 3D scenes with `VICTORY_PORT_STATIC=1` on RTX A4500 |
 | **3D Lighting & Shaders** | Partial | Deferred lighting, shadows, and environment geometry render; initial scene streaming warms up during the opening cutscene |
 | **Known Issues** | Active | Facial morph targets (`Dispatch` blendshapes) remain static during cutscenes; minor BC7/SSS skin detiling artifacts on character faces/forearms |
@@ -70,5 +71,6 @@ $env:VICTORY_KBM_GTA = "1"
 ## Disclaimer
 
 This repository contains **source code only**. No copyrighted game assets, encryption keys, or precompiled executables are hosted, distributed, or linked. Licensed under **GPL-3.0**.
+
 
 
