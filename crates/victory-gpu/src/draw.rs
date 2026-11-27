@@ -1328,6 +1328,9 @@ impl State {
     /// Viewports, scissors, the blend factor and the stencil reference: set
     /// on the host list at once, and kept for [`State::replay`].
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        if crate::port_static::on() && self.viewports.as_slice() == viewports {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if let Some(v) = viewports.first() {
             crate::host::spans::viewport(v.Width as u32, v.Height as u32);
@@ -1338,6 +1341,9 @@ impl State {
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        if crate::port_static::on() && self.scissors.as_slice() == rects {
+            return;
+        }
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
         if scissor_test() {
@@ -3874,7 +3880,7 @@ impl State {
                 (table, n, h.0)
             };
             if let Some((sigs, all_static)) = &mut sigs_out {
-                if n > 64 || !selected.is_empty() || group.has_uav || sigs.len() >= 8 {
+                if n > 64 || !selected.is_empty() || sigs.len() >= 8 {
                     **all_static = false;
                 } else {
                     sigs.push(key);

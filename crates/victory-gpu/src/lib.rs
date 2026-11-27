@@ -62,6 +62,8 @@ mod port_journal;
 #[cfg(windows)]
 pub mod port_static;
 #[cfg(windows)]
+pub mod tequesta_ui;
+#[cfg(windows)]
 mod land;
 pub mod list;
 pub mod object;

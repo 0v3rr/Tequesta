@@ -96,6 +96,93 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
+const WM_INPUT: u32 = 0x00FF;
+const RID_INPUT: u32 = 0x1000_0003;
+const RIM_TYPEMOUSE: u32 = 0;
+const MOUSE_MOVE_ABSOLUTE: u16 = 1;
+
+#[repr(C)]
+struct RawInputDevice {
+    us_usage_page: u16,
+    us_usage: u16,
+    dw_flags: u32,
+    hwnd_target: HWND,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawInputHeader {
+    dw_type: u32,
+    dw_size: u32,
+    h_device: isize,
+    w_param: WPARAM,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawMouse {
+    us_flags: u16,
+    _pad: u16,
+    ul_buttons: u32,
+    ul_raw_buttons: u32,
+    l_last_x: i32,
+    l_last_y: i32,
+    ul_extra_information: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawInputMousePacket {
+    header: RawInputHeader,
+    mouse: RawMouse,
+}
+
+const _: () = assert!(
+    size_of::<RawInputHeader>() == 24 && size_of::<RawMouse>() == 24 && size_of::<RawInputMousePacket>() == 48
+);
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn RegisterRawInputDevices(devices: *const RawInputDevice, num_devices: u32, size: u32) -> i32;
+    fn GetRawInputData(
+        h_raw_input: isize,
+        ui_command: u32,
+        p_data: *mut c_void,
+        pcb_size: *mut u32,
+        cb_size_header: u32,
+    ) -> u32;
+}
+
+fn borderless_requested() -> bool {
+    std::env::var("VICTORY_BORDERLESS")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
+
+fn apply_window_mode(parent: HWND, style: u32, x: i32, y: i32, width: i32, height: i32) -> (u32, i32, i32, i32, i32) {
+    if parent.is_null() && borderless_requested() {
+        // SAFETY: plain Win32 primary display metrics query.
+        let (sw, sh) = unsafe {
+            (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN))
+        };
+        if sw > 0 && sh > 0 {
+            return (wm::WS_POPUP | wm::WS_VISIBLE, 0, 0, sw, sh);
+        }
+    }
+    let (fx, fy, fw, fh) = fit(parent, x, y, width, height);
+    (style, fx, fy, fw, fh)
+}
+
+fn restart_from_menu() {
+    end_title(
+        "F1 menu restart",
+        Box::new(|| relaunch(std::env::args_os().skip(1).collect())),
+    );
+}
+
+fn quit_from_menu() {
+    end_title("F1 menu quit", Box::new(|| {}));
+}
+
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
@@ -110,7 +197,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = apply_window_mode(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -136,7 +223,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = apply_window_mode(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -226,10 +313,24 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
-/// Puts our procedure in front of the title's.
+/// Puts our procedure in front of the title's and registers F1 menu + Raw Input mouse.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
         return;
+    }
+    static UI_ACTIONS: std::sync::Once = std::sync::Once::new();
+    UI_ACTIONS.call_once(|| {
+        victory_gpu::tequesta_ui::register_actions(restart_from_menu, quit_from_menu);
+    });
+    let rid = RawInputDevice {
+        us_usage_page: 0x01,
+        us_usage: 0x02,
+        dw_flags: 0,
+        hwnd_target: hwnd,
+    };
+    // SAFETY: registers standard HID mouse raw input for this window.
+    unsafe {
+        let _ = RegisterRawInputDevices(&rid, 1, size_of::<RawInputDevice>() as u32);
     }
     // SAFETY: a window this thread just created. The title's procedure is
     // stored before ours can run.
@@ -246,6 +347,30 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_INPUT {
+        let mut buf = [0u8; 64];
+        let mut size = buf.len() as u32;
+        // SAFETY: `lparam` is an `HRAWINPUT` handle for this `WM_INPUT` message.
+        let read = unsafe {
+            GetRawInputData(
+                lparam,
+                RID_INPUT,
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                size_of::<RawInputHeader>() as u32,
+            )
+        };
+        if read != u32::MAX && (read as usize) >= size_of::<RawInputMousePacket>() {
+            // SAFETY: `buf` is at least `size_of::<RawInputMousePacket>()` bytes.
+            let pkt = unsafe { buf.as_ptr().cast::<RawInputMousePacket>().read_unaligned() };
+            if pkt.header.dw_type == RIM_TYPEMOUSE
+                && (pkt.mouse.us_flags & MOUSE_MOVE_ABSOLUTE) == 0
+                && (pkt.mouse.l_last_x != 0 || pkt.mouse.l_last_y != 0)
+            {
+                super::gameinput::push_raw_mouse_delta(pkt.mouse.l_last_x, pkt.mouse.l_last_y);
+            }
+        }
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
@@ -263,9 +388,18 @@ extern "system" fn window_proc(
     }
     // Auto-hide the Windows cursor inside the game window's client area while
     // GTA mouse-look lock (`~` / `F2`) is active, and restore it immediately
-    // when unlocked (`~` / `F2` / `Esc` / `P`).
+    // when unlocked (`~` / `F2` / `Esc` / `P`) or when the F1 menu is open.
     if message == wm::WM_SETCURSOR && (lparam as u32 & 0xFFFF) == wm::HTCLIENT {
         static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+        if victory_gpu::tequesta_ui::menu_open() {
+            CURSOR_HIDDEN.store(false, Ordering::Relaxed);
+            // SAFETY: shows standard arrow cursor inside our window while F1 menu is open.
+            unsafe {
+                let arrow = wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW);
+                wm::SetCursor(arrow);
+            }
+            return 1;
+        }
         if super::gameinput::cursor_locked() {
             CURSOR_HIDDEN.store(true, Ordering::Relaxed);
             // SAFETY: hides the cursor only inside our client area on the UI thread.

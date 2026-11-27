@@ -9352,6 +9352,8 @@ struct Presenter {
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
     panel: panel::Panel,
+    tequesta_ui: crate::tequesta_ui::TequestaOverlay,
+    last_pace: Option<std::time::Instant>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -10061,6 +10063,18 @@ impl Host {
                 crate::popwatch::take(&self.device, list, texture)
             };
             p.panel.draw(self, copy, &back, (width, height), format);
+            let last_ms = (p.meter.last_frame.elapsed().as_secs_f32() * 1000.0).clamp(0.1, 9999.0);
+            let approx_fps = (1000.0 / last_ms).min(999.9);
+            p.tequesta_ui.update_and_draw(
+                self,
+                copy,
+                &back,
+                (width, height),
+                format,
+                p.hwnd,
+                approx_fps,
+                last_ms,
+            );
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -10124,6 +10138,28 @@ impl Host {
             if !presented && perf_trace_on() && status == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED {
                 p.meter.frame(p.hwnd);
             }
+            let cap = crate::tequesta_ui::fps_cap();
+            if cap > 0 {
+                let target = std::time::Duration::from_secs_f64(1.0 / f64::from(cap));
+                let now = std::time::Instant::now();
+                if let Some(prev) = p.last_pace {
+                    let deadline = prev + target;
+                    if now < deadline {
+                        let rem = deadline - now;
+                        if rem > std::time::Duration::from_millis(2) {
+                            std::thread::sleep(rem - std::time::Duration::from_millis(2));
+                        }
+                        while std::time::Instant::now() < deadline {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    p.last_pace = Some(deadline.max(now));
+                } else {
+                    p.last_pace = Some(now);
+                }
+            } else {
+                p.last_pace = None;
+            }
             showing.end();
             if !presented { return None; }
             #[cfg(feature = "diagnostics")]
@@ -10181,6 +10217,8 @@ impl Host {
                 meter: Meter::new(),
                 composer: None,
                 panel: panel::Panel::new(),
+                tequesta_ui: crate::tequesta_ui::TequestaOverlay::new(),
+                last_pace: None,
             })
         }
     }

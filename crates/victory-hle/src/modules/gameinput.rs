@@ -120,11 +120,29 @@ const GTA_BUTTONS: [(u8, u32); 26] = [
 #[cfg(windows)]
 static CURSOR_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(windows)]
+static RAW_MOUSE_DX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+#[cfg(windows)]
+static RAW_MOUSE_DY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+#[cfg(windows)]
+static RAW_MOUSE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Accumulates relative mouse deltas from `WM_INPUT` (Raw Input) while mouse-look
+/// is locked and the `F1` overlay menu is closed.
+#[cfg(windows)]
+pub(crate) fn push_raw_mouse_delta(dx: i32, dy: i32) {
+    RAW_MOUSE_ACTIVE.store(true, Ordering::Relaxed);
+    if CURSOR_LOCKED.load(Ordering::Relaxed) && !victory_gpu::tequesta_ui::menu_open() {
+        RAW_MOUSE_DX.fetch_add(dx, Ordering::Relaxed);
+        RAW_MOUSE_DY.fetch_add(dy, Ordering::Relaxed);
+    }
+}
+
 /// Returns true while GTA mouse-look lock (`~` / `F2`) is active and the
 /// cursor should be hidden inside the client area.
 #[cfg(windows)]
 pub(crate) fn cursor_locked() -> bool {
-    CURSOR_LOCKED.load(Ordering::Relaxed)
+    CURSOR_LOCKED.load(Ordering::Relaxed) && !victory_gpu::tequesta_ui::menu_open()
 }
 
 /// Parses an opt-in boolean environment variable (`1`, `true`, `yes`, `on`,
@@ -136,26 +154,39 @@ fn parse_env_flag(value: &str) -> bool {
     )
 }
 
-/// GTA V PC-style keyboard + mouse stand-in pad (`VICTORY_KBM_GTA=1`).
-/// Off by default so the existing keyboard table and tests stay unchanged.
-fn gta_kbm() -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("VICTORY_KBM_GTA").is_ok_and(|v| parse_env_flag(&v)));
+/// Native Raw Input keyboard/mouse (`VICTORY_KBM_NATIVE=1`).
+fn native_kbm() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        if let Ok(v) = std::env::var("VICTORY_KBM_NATIVE") {
+            return parse_env_flag(&v);
+        }
+        #[cfg(windows)]
+        {
+            victory_gpu::tequesta_ui::kbm_native_enabled()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    });
     *ENABLED
 }
 
-/// Mouse-look sensitivity multiplier for `VICTORY_KBM_GTA=1`
-/// (`VICTORY_MOUSE_SENS`, default `1.0`).
+/// GTA V PC-style keyboard + mouse stand-in pad (`VICTORY_KBM_GTA=1` or `VICTORY_KBM_NATIVE=1`).
+/// Off by default in unit tests unless enabled so existing keyboard table tests stay unchanged.
+fn gta_kbm() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("VICTORY_KBM_GTA").is_ok_and(|v| parse_env_flag(&v))
+            || std::env::var("VICTORY_KBM_NATIVE").is_ok_and(|v| parse_env_flag(&v))
+    });
+    *ENABLED
+}
+
+/// Mouse-look sensitivity multiplier for `VICTORY_KBM_GTA=1` / `VICTORY_KBM_NATIVE=1`
+/// (live-editable from the F1 menu, seeded from `VICTORY_MOUSE_SENS`).
 #[cfg(windows)]
 fn mouse_sens() -> f32 {
-    static SENS: LazyLock<f32> = LazyLock::new(|| {
-        std::env::var("VICTORY_MOUSE_SENS")
-            .ok()
-            .and_then(|s| s.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(1.0)
-    });
-    *SENS
+    victory_gpu::tequesta_ui::mouse_sensitivity()
 }
 
 /// Invert mouse Y axis for `VICTORY_KBM_GTA=1` (`VICTORY_MOUSE_INVERT_Y=1`).
@@ -299,12 +330,41 @@ fn fallback_for(keys: &[KeyState], gta: bool) -> PadState {
             0.0
         }
     };
-    let table: &[(u8, u32)] = if gta { &GTA_BUTTONS } else { &FALLBACK_BUTTONS };
-    PadState {
-        buttons: table
+    let on_scancode = |sc: u32, vk_fallback: u8| {
+        if keys
             .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
+            .any(|k| k.scan_code == sc || k.virtual_key == vk_fallback)
+        {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    let mut buttons = GTA_BUTTONS
+        .iter()
+        .take(0)
+        .fold(0u32, |a, b| a | b.1);
+    let table: &[(u8, u32)] = if gta { &GTA_BUTTONS } else { &FALLBACK_BUTTONS };
+    buttons |= table
+        .iter()
+        .filter(|(vk, _)| on(*vk) != 0.0)
+        .fold(0, |all, (_, bit)| all | bit);
+    if gta && native_kbm() {
+        // Layout-independent AZERTY (ZQSD) + QWERTY (WASD) scancode movement.
+        let left_y = on_scancode(0x11, b'W') - on_scancode(0x1F, b'S');
+        let left_x = on_scancode(0x20, b'D') - on_scancode(0x1E, b'A');
+        return PadState {
+            buttons,
+            left_trigger: 0.0,
+            right_trigger: 0.0,
+            left_x,
+            left_y,
+            right_x: on(b'L') - on(b'J'),
+            right_y: on(b'I') - on(b'K'),
+        };
+    }
+    PadState {
+        buttons,
         left_trigger: if gta { 0.0 } else { on(b'Z') },
         right_trigger: if gta { 0.0 } else { on(b'C') },
         left_x: on(b'D') - on(b'A'),
@@ -1422,6 +1482,7 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
+            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1433,7 +1494,21 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
+            #[cfg(not(feature = "diagnostics"))]
+            let mut down = Vec::new();
+            if victory_gpu::tequesta_ui::menu_open() {
+                return down
+                    .into_iter()
+                    .map(|vk| KeyState {
+                        // SAFETY: plain query.
+                        scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                        virtual_key: vk,
+                        ..Default::default()
+                    })
+                    .collect();
+            }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1466,8 +1541,10 @@ mod host {
         }
 
         fn mouse_pad(&mut self, active: bool) -> PadState {
-            if !gta_kbm() || !active {
-                self.disarm_mouse(foreground_window(), "stand-in inactive");
+            if !gta_kbm() || !active || victory_gpu::tequesta_ui::menu_open() {
+                self.disarm_mouse(foreground_window(), "menu or stand-in inactive");
+                RAW_MOUSE_DX.store(0, Ordering::Relaxed);
+                RAW_MOUSE_DY.store(0, Ordering::Relaxed);
                 return PadState::default();
             }
             let Some(hwnd) = foreground_window() else {
@@ -1521,16 +1598,27 @@ mod host {
             let (right_x, right_y) = if self.mouse_locked {
                 let cx = c_left + (c_right - c_left) / 2;
                 let cy = c_top + (c_bottom - c_top) / 2;
+                let (rdx, rdy) = (
+                    RAW_MOUSE_DX.swap(0, Ordering::Relaxed),
+                    RAW_MOUSE_DY.swap(0, Ordering::Relaxed),
+                );
+                let use_raw = native_kbm() && RAW_MOUSE_ACTIVE.load(Ordering::Relaxed);
                 let (dx, dy) = if self.just_locked {
                     self.just_locked = false;
                     if let Some(anchor) = recenter_cursor(cx, cy) {
                         self.anchor = anchor;
-                    } else {
+                    } else if !use_raw {
                         self.set_mouse_locked(false, Some(hwnd));
                         self.mouse_look.reset();
                         tracing::warn!("mouse look unlocked (cursor warp failed)");
                     }
                     (0, 0)
+                } else if use_raw {
+                    // Keep cursor inside client area without FPS-coupled jitter.
+                    if pos.x <= c_left + 32 || pos.x >= c_right - 32 || pos.y <= c_top + 32 || pos.y >= c_bottom - 32 {
+                        let _ = recenter_cursor(cx, cy);
+                    }
+                    (rdx, rdy)
                 } else {
                     let dx = pos.x - self.anchor.0;
                     let dy = pos.y - self.anchor.1;
@@ -1588,6 +1676,7 @@ mod host {
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();

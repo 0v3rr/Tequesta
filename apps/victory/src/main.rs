@@ -250,6 +250,8 @@ fn main() -> Result<()> {
             console,
             title_args,
         } => {
+            let tcfg = victory_core::TequestaConfig::load();
+            tcfg.apply_startup_env();
             victory_hle::runtime::set_title_args(title_args);
             run::run(&exe, unimplemented, strict, execute, console)
         }
