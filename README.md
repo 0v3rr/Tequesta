@@ -14,11 +14,21 @@ Tested on **Microsoft Windows 11 Famille (x64)** — **AMD EPYC 7543P 32-Core Pr
 | **Main Menu** | Working | Full 2D/UI rendering at **30 FPS** |
 | **In-Game 3D World** | Working | Boots into Lucia's opening prologue (café cutscene & prison sequence before gaining control of Lucia) |
 | **Playable & Controls** | Working | Full character movement in the prison and subsequent scenes with working HUD, pause menu, AZERTY/QWERTY keyboard support (including AZERTY scancode `0x10` cover `RB` and `E` interaction), and a dedicated `125 Hz` `RawMousePump` (`WM_INPUT` + cursor-delta fallback, auto-captured on focus when `F1` is closed, `F2`/`~` toggle, `Esc`/`F1` unlock) |
-| **In-Game Frame Rate** | **5–27 FPS** | Measured in active 3D scenes with `VICTORY_PORT_STATIC=1` on RTX A4500 |
+| **In-Game Frame Rate** | **2-14 FPS** | Measured in active 3D scenes with `VICTORY_PORT_STATIC=1` on RTX A4500 |
 | **3D Lighting & Shaders** | Partial | Deferred lighting, shadows, and environment geometry render; startup shader prewarm and pipeline caching enabled by default, with live `F1` toggles for ambient light and reflection guard |
 | **Known Issues** | Active | Facial morph targets (`Dispatch` blendshapes) remain static during cutscenes; minor BC7/SSS skin detiling artifacts on character faces/forearms |
 
-> **Video Proof:** [GTA VI In-Game on NVIDIA RTX A4500 (earlier 6–12 FPS capture)](https://www.youtube.com/watch?v=V8ioeQRAytM)
+## Verified In-Game Capture & Status
+
+* **Status:** Bootable / In-Game / Playable (Character control & camera movement verified)
+* **Gameplay Capture (HUD + `F1` Overlay + Movement):** [Watch on YouTube](https://www.youtube.com/watch?v=m0yCL6uZvAU)
+* **Tested Hardware:** AMD EPYC 7543P (32-Core) · NVIDIA RTX A4500 (20 GB VRAM) · 28 GB RAM · Windows
+* **Measured Performance (1080p, `QUALITY` lighting profile):** ~8–9 FPS average (2–14 FPS range, ~6,400 draw calls/frame)
+* **Implemented Highlights:**
+  * Custom `F1` in-game configuration menu & `F3` detailed real-time telemetry HUD
+  * Native keyboard & mouse support (`125 Hz` camera control)
+  * D3D12 command-list batching, barrier coalescing, and zero-copy constant/descriptor ports
+  * Reflection probe & volumetric air guard (`QUALITY` preset) preventing washed-out wet-floor/puddle reflections
 
 ## Architecture Overview
 
