@@ -109,3 +109,35 @@ Pre-translate RDNA2 shaders to DXIL in parallel and populate the `ID3D12Pipeline
 
 ```powershell
 cargo run --release --locked -p victory -- --precompile-shaders "<PATH_TO_GAME_DIR>"
+### Step-by-Step Setup Guide (Beginners)
+
+#### 1. Install Build Prerequisites (Windows 10/11 x64)
+1. **Install Visual Studio Build Tools (C++):**
+- Download and run the [Visual Studio Build Tools installer](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
+- Select the **Desktop development with C++** workload (includes the MSVC linker and Windows 10/11 SDK required by Rust).
+2. **Install Rust (msvc toolchain):**
+- Download and run `rustup-init.exe` from [rustup.rs](https://rustup.rs/) and choose the default installation (`stable-x86_64-pc-windows-msvc`).
+- Open a new PowerShell terminal and verify the toolchain: `rustc --version` and `cargo --version`.
+3. **Update NVIDIA Drivers:**
+- Ensure a recent DirectX 12 / Shader Model 6.6+ NVIDIA Game Ready or Studio driver is installed.
+
+#### 2. Clone & Compile Tequesta (Release Build)
+1. Clone the repository and enter the project directory:
+`git clone https://github.com/0v3rr/Tequesta.git && cd Tequesta`
+2. Build the `victory` runtime in release mode:
+`cargo build --release --locked -p victory`
+- The compiled executable is generated at `target\release\victory.exe`.
+
+#### 3. Prepare Your Local Game Directory
+1. Place your legally dumped Xbox Series (Scarlett) build files into a local folder (e.g. `D:\Games\GTAVI_Scarlett\`), ensuring `game_scarlett_master.exe` and its data/shader archives are present.
+2. *(Optional)* Pre-translate RDNA2 shaders to DXIL and warm up the D3D12 pipeline cache before launching:
+`.\target\release\victory.exe --precompile-shaders "D:\Games\GTAVI_Scarlett"`
+
+#### 4. Launch & Configure In-Game (F1 Overlay)
+1. Start the game with the recommended NVIDIA RTX environment flags:
+`$env:VICTORY_PORT_STATIC="1"; $env:VICTORY_THIN="1"; $env:VICTORY_JOIN_PARTS="8"; $env:VICTORY_CARD_REHASH_RUNS="1"; $env:VICTORY_KBM_NATIVE="1"; $env:VICTORY_RAW_VIEWS="0"; .\target\release\victory.exe "D:\Games\GTAVI_Scarlett\game_scarlett_master.exe"`
+2. Wait through the initial shader/pipeline warm-up and opening prologue cutscene until Lucia is controllable.
+3. Press **F1** at any time to open the native D3D12 configuration menu (`tequesta_config.toml` is created automatically on first change):
+- Keep **DIRECT GPU VIEWS** set to **OFF** (`VICTORY_RAW_VIEWS=0`) on NVIDIA GPUs.
+- Keep **SHADER PRELOAD** and **PIPELINE CACHE** set to **ON** for faster subsequent boots.
+- For higher frame rates or lower VRAM usage, switch **RESOLUTION SCALE** to **75%** or **50%** and click **APPLY & RESTART**.
