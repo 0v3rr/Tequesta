@@ -466,12 +466,19 @@ pub(crate) fn sync_heaps() {
         let in_place = sync_in_place() && step == 32 && crate::safecopy::on();
         let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(pages_a_job).map(|_| Default::default()).collect();
         let phase = crate::timeline::span("the heaps' records: pages read and compared");
+        thread_local! {
+            static SYNC_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u32>, Vec<u64>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+        }
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
-            let mut page_bytes: Vec<u8> = Vec::new();
-            let mut changed: Vec<u32> = Vec::new();
-            let mut bits: Vec<u64> = Vec::new();
-            for &(from, to, check) in parts.chunks(pages_a_job).nth(n).unwrap_or_default() {
+            SYNC_SCRATCH.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                let (page_bytes, changed, bits) = &mut *scratch;
+                page_bytes.clear();
+                changed.clear();
+                bits.clear();
+                for &(from, to, check) in parts.chunks(pages_a_job).nth(n).unwrap_or_default() {
                 let checking = check.then(std::time::Instant::now);
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                 // A record that straddles the range's ends is left
@@ -486,7 +493,7 @@ pub(crate) fn sync_heaps() {
                     changed.clear();
                     // SAFETY: as below; title memory is read by a copy that
                     // fails where a page is not there.
-                    let whole = unsafe { copied.changes_in_place(first as u32, lead as *const u8, count as usize, &mut bits, &mut changed) };
+                    let whole = unsafe { copied.changes_in_place(first as u32, lead as *const u8, count as usize, bits, changed) };
                     out.ns[1] += since(at);
                     // (A run of marked slots is no page; nor does it ask the guards.)
                     if !port || check {
@@ -507,7 +514,7 @@ pub(crate) fn sync_heaps() {
                     // where 2,048 reads in place would fault.
                     let at = std::time::Instant::now();
                     page_bytes.resize(to - from, 0);
-                    if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                    if !crate::host::read_into(from as *const u8, page_bytes) {
                         continue;
                     }
                     out.ns[0] += since(at);
@@ -525,12 +532,12 @@ pub(crate) fn sync_heaps() {
                     let at = std::time::Instant::now();
                     // SAFETY: the parts are ranges of the heap apart from one
                     // another, and only records that lie whole in one are its.
-                    unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
+                    unsafe { copied.changes(first as u32, &records[..(count * step) as usize], changed) };
                     out.ns[1] += since(at);
                     records
                 };
                 let at = std::time::Instant::now();
-                for &index in &changed {
+                for &index in changed.iter() {
                     let at = (u64::from(index) - first) as usize * step as usize;
                     let word = |n: usize| {
                         records
@@ -580,7 +587,11 @@ pub(crate) fn sync_heaps() {
                 if let Some(began) = checking {
                     crate::port_descriptors::CHECKED[4].fetch_add(since(began), Relaxed);
                 }
-            }
+                }
+                if page_bytes.capacity() > (1 << 20) {
+                    page_bytes.shrink_to(64 << 10);
+                }
+            });
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
         });
         phase.end();

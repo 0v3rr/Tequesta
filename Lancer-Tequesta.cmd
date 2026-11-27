@@ -19,6 +19,8 @@ set "VICTORY_CARD_REHASH_RUNS=1"
 set "VICTORY_CARD_BUFFERS_MIN_KB=64"
 set "VICTORY_INDIRECT_WINDOW=1"
 set "VICTORY_INDIRECT_BATCH=2"
+set "VICTORY_JOIN_BARRIERS=1"
+set "VICTORY_UP_QUEUE=1"
 set "VICTORY_LOG=error"
 .\target\release\victory.exe run --console series-s --execute "C:\Games\GTA6.Xbox.v1.0.2.1\game_scarlett_master.exe"
 pause

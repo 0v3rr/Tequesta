@@ -10,6 +10,16 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// `[calls, us]` spent waiting for dynamic descriptor slots.
+static DYN_WAIT_TRACE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub(crate) fn take_dyn_wait_stats() -> [u64; 2] {
+    [
+        DYN_WAIT_TRACE[0].swap(0, Ordering::Relaxed),
+        DYN_WAIT_TRACE[1].swap(0, Ordering::Relaxed),
+    ]
+}
+
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
@@ -1896,8 +1906,15 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
+                    let t0 = std::time::Instant::now();
+                    crate::host::wait_for_dynamic_slots();
+                    let r = host.dynamic(1).or_else(|| {
+                        crate::host::settle_for_fence();
+                        host.dynamic(1)
+                    });
+                    DYN_WAIT_TRACE[0].fetch_add(1, Ordering::Relaxed);
+                    DYN_WAIT_TRACE[1].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    r
                 }) else {
                     return false;
                 };
@@ -1970,8 +1987,15 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
+                    let t0 = std::time::Instant::now();
+                    crate::host::wait_for_dynamic_slots();
+                    let r = host.dynamic(1).or_else(|| {
+                        crate::host::settle_for_fence();
+                        host.dynamic(1)
+                    });
+                    DYN_WAIT_TRACE[0].fetch_add(1, Ordering::Relaxed);
+                    DYN_WAIT_TRACE[1].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    r
                 }) else {
                     return false;
                 };
@@ -3551,8 +3575,15 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
+                let t0 = std::time::Instant::now();
+                crate::host::wait_for_dynamic_slots();
+                let r = host.dynamic(n).or_else(|| {
+                    crate::host::settle_for_fence();
+                    host.dynamic(n)
+                });
+                DYN_WAIT_TRACE[0].fetch_add(1, Ordering::Relaxed);
+                DYN_WAIT_TRACE[1].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                r
             }) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.

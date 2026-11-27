@@ -1012,6 +1012,9 @@ fn create() -> windows::core::Result<Host> {
         if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            if trace_frame_on() {
+                eprintln!("[TEQUESTA][ADAPTER] WARP (VICTORY_D3D12_WARP=1)");
+            }
             tracing::info!("host device on the software adapter (WARP)");
         } else {
             device = Some(victory_shader::emit::host::create_preferred_device()?);
@@ -1082,6 +1085,23 @@ fn create() -> windows::core::Result<Host> {
             .ok();
         if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
             let name = String::from_utf16_lossy(&desc.Description);
+            let software = (desc.Flags & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0;
+            if trace_frame_on() {
+                eprintln!(
+                    "[TEQUESTA][ADAPTER] name=\"{}\" vendor={:#06x} device={:#06x} vram={}MB software={} wave={}..{} d3d12_bg_off={}",
+                    name.trim_end_matches('\0'),
+                    desc.VendorId,
+                    desc.DeviceId,
+                    desc.DedicatedVideoMemory >> 20,
+                    software,
+                    o1.WaveLaneCountMin,
+                    o1.WaveLaneCountMax,
+                    std::env::var_os("VICTORY_D3D12_BACKGROUND").is_some_and(|v| v == "0"),
+                );
+                if software {
+                    eprintln!("[TEQUESTA][WARN] SOFTWARE / WARP / Basic Render Driver adapter selected!");
+                }
+            }
             tracing::info!(
                 adapter = name.trim_end_matches('\0'),
                 vendor = format_args!("{:#06x}", desc.VendorId),
@@ -3432,8 +3452,31 @@ pub(crate) fn settle_now(why: usize) {
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
 }
+pub(crate) fn trace_frame_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_FRAME").is_none_or(|v| v != "0"))
+}
+
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
+}
+
+/// Waits for at least one in-flight submission to land and release its
+/// dynamic descriptor slots, without taking the submission lock or
+/// draining the whole GPU when [`relay`] is active.
+pub(crate) fn wait_for_dynamic_slots() {
+    if !late() {
+        return;
+    }
+    if relay() {
+        let before = FINISHED.load(Ordering::Acquire);
+        relay_wait(WHY_FENCE, |line| {
+            FINISHED.load(Ordering::Acquire) > before
+                || (line.line.is_empty() && !line.settling)
+        });
+    } else {
+        settle_for_fence();
+    }
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -3763,9 +3806,9 @@ impl RelayBack {
 
 /// For the frame-rate line, with [`late`]: what the line of flights did
 /// per frame since the last one.
-fn late_line(frames: f64) {
+fn late_line(frames: f64) -> [f64; 11] {
     if !late() {
-        return;
+        return [0.0; 11];
     }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
@@ -3795,8 +3838,12 @@ fn late_line(frames: f64) {
         s[13],
         s[14],
     );
+    let mut waited_ms = [0.0f64; 11];
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
+        for (dst, &src) in waited_ms.iter_mut().zip(w.iter()) {
+            *dst = src;
+        }
         tracing::info!(
             "of the waiting for the card in settles, per frame, by what settled: a synchronous submission or present {:.1} ms, \
              the card had run them {:.1}, a wait for a memory value {:.1}, title memory changed under shader writes {:.1}, \
@@ -3888,6 +3935,7 @@ fn late_line(frames: f64) {
             u[8],
         );
     }
+    waited_ms
 }
 
 pub(crate) mod aside;
@@ -5782,10 +5830,12 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
-            // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
+            // `sweep()` retires freed resources through `bury_lag()` (and
+            // `pool::room` only reclaims blocks empty for > REST), so it does
+            // not need to drain in-flight GPU work unless `upcheck` asks for
+            // the card at rest.
             if upcheck::on() {
+                self.settle(&mut submitted, WHY_SYNC);
                 upcheck::at_rest(self);
             }
             sweep();
@@ -9366,8 +9416,28 @@ impl Meter {
             );
             crate::shadow::exact_line(frames);
             crate::descriptor::sync_line(frames);
-            late_line(frames);
-            crate::queue::behind_line(frames);
+            let late_w = late_line(frames);
+            let q_ms = crate::queue::behind_line(frames);
+            let fence_s = crate::fence::take_trace_stats();
+            let dyn_s = crate::draw::take_dyn_wait_stats();
+            let pipe_s = crate::pipeline::take_trace_stats();
+            if trace_frame_on() {
+                eprintln!(
+                    "[TEQUESTA][1s] {fps:.1}fps {ms:.1}ms/f | draws={draws:.0} drop={dropped:.0} | submit_cpu={cpu:.1}ms(copy={copy_ms:.1} tex={texture_ms:.1} other={:.1}) submit_gpu={gpu:.1}ms back={back_ms:.1}ms | q(busy={:.1} pres={:.1} room={:.1} drain={:.1})ms",
+                    (cpu - copy_ms - texture_ms).max(0.0),
+                    q_ms[0], q_ms[1], q_ms[2], q_ms[3],
+                );
+                eprintln!(
+                    "[TEQUESTA][1s]   settle_ms(sync={:.1} val={:.1} stale={:.1} read={:.1} most={:.1} fence={:.1}) | fence_blk(settle={:.1} woa={:.1} n={} to={}) | dyn_wait={:.1}ms(n={}) | pipe_wait={:.1}ms(norm={:.1} scr={:.1} n={} q={} veh={} bad={})",
+                    late_w[WHY_SYNC], late_w[WHY_VALUE], late_w[WHY_STALE], late_w[WHY_READ], late_w[WHY_MOST], late_w[WHY_FENCE],
+                    fence_s[1] as f64 / 1000.0 / frames, fence_s[2] as f64 / 1000.0 / frames, fence_s[0], fence_s[3],
+                    dyn_s[1] as f64 / 1000.0 / frames, dyn_s[0],
+                    (pipe_s[0] + pipe_s[1]) as f64 / 1000.0 / frames,
+                    pipe_s[0] as f64 / 1000.0 / frames,
+                    pipe_s[1] as f64 / 1000.0 / frames,
+                    pipe_s[2], pipe_s[3], pipe_s[4], pipe_s[5],
+                );
+            }
             card_clock_line(frames, ms);
             upq::line(frames);
             rec::line(frames);

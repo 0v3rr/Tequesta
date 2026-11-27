@@ -9,6 +9,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+/// `[calls, settle_us, woa_us, timeouts]` for 1s frame telemetry.
+#[cfg(windows)]
+static FENCE_TRACE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+#[cfg(windows)]
+pub(crate) fn take_trace_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| FENCE_TRACE[i].swap(0, Ordering::Relaxed))
+}
+
 pub(crate) const FENCE_IIDS: [Iid; 5] = [
     guid(
         0x0a753dcf,
@@ -105,23 +114,48 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     crate::timeline::told("an event asked for", this as usize, value);
     if event.is_null() {
         drop(waiters);
+        #[cfg(windows)]
+        FENCE_TRACE[0].fetch_add(1, Ordering::Relaxed);
+        #[cfg(windows)]
+        let mut settle_us = 0u64;
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
         #[cfg(windows)]
         if crate::host::late() {
+            let t0 = std::time::Instant::now();
             crate::queue::before_sync();
             crate::host::settle_for_fence();
+            settle_us = t0.elapsed().as_micros() as u64;
+            FENCE_TRACE[1].fetch_add(settle_us, Ordering::Relaxed);
             if fence.value.load(Ordering::Acquire) >= value {
+                if settle_us >= 100_000 && crate::host::trace_frame_on() {
+                    eprintln!(
+                        "[TEQUESTA][FENCE_BLOCK] value={} settle={:.1}ms woa=0.0ms timed_out=false",
+                        value,
+                        settle_us as f64 / 1000.0,
+                    );
+                }
                 return S_OK;
             }
         }
         #[cfg(windows)]
         {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            let woa_t0 = std::time::Instant::now();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
             loop {
                 let current = fence.value.load(Ordering::Acquire);
                 if current >= value {
+                    let woa_us = woa_t0.elapsed().as_micros() as u64;
+                    FENCE_TRACE[2].fetch_add(woa_us, Ordering::Relaxed);
+                    if settle_us + woa_us >= 100_000 && crate::host::trace_frame_on() {
+                        eprintln!(
+                            "[TEQUESTA][FENCE_BLOCK] value={} settle={:.1}ms woa={:.1}ms timed_out=false",
+                            value,
+                            settle_us as f64 / 1000.0,
+                            woa_us as f64 / 1000.0,
+                        );
+                    }
                     return S_OK;
                 }
                 let now = std::time::Instant::now();
@@ -140,8 +174,27 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
                 }
                 crate::queue::release_held(false);
             }
+            let woa_us = woa_t0.elapsed().as_micros() as u64;
+            FENCE_TRACE[2].fetch_add(woa_us, Ordering::Relaxed);
             if fence.value.load(Ordering::Acquire) >= value {
+                if settle_us + woa_us >= 100_000 && crate::host::trace_frame_on() {
+                    eprintln!(
+                        "[TEQUESTA][FENCE_BLOCK] value={} settle={:.1}ms woa={:.1}ms timed_out=false",
+                        value,
+                        settle_us as f64 / 1000.0,
+                        woa_us as f64 / 1000.0,
+                    );
+                }
                 return S_OK;
+            }
+            FENCE_TRACE[3].fetch_add(1, Ordering::Relaxed);
+            if crate::host::trace_frame_on() {
+                eprintln!(
+                    "[TEQUESTA][FENCE_BLOCK] value={} settle={:.1}ms woa={:.1}ms timed_out=true",
+                    value,
+                    settle_us as f64 / 1000.0,
+                    woa_us as f64 / 1000.0,
+                );
             }
             tracing::warn!(value, "blocking fence wait timed out");
             return E_NOTIMPL;

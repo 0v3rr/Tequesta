@@ -473,6 +473,11 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+#[cfg(windows)]
+pub(crate) fn take_trace_stats() -> [u64; 6] {
+    make::take_trace_stats()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

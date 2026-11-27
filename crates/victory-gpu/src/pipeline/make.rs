@@ -143,7 +143,10 @@ impl Pending {
         // and anyone else asking would wait for it forever.
         if self.made.get().is_none() {
             let made = if is_bad_key(&self.key) {
-                SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
+                let n = SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
+                if n < 16 && crate::host::trace_frame_on() {
+                    eprintln!("[TEQUESTA][WARM_BAD] skipped key={} shaders={:?}", self.key, self.shaders);
+                }
                 tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before");
                 None
             } else {
@@ -164,6 +167,19 @@ impl Pending {
 /// Pipelines not made for being on the list of those the driver's compiler
 /// crashes on.
 static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
+/// `[normal_us, screen_us, wait_calls, veh_crashes]` for 1s telemetry.
+static TRACE_WAIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn take_trace_stats() -> [u64; 6] {
+    [
+        TRACE_WAIT[0].swap(0, Ordering::Relaxed),
+        TRACE_WAIT[1].swap(0, Ordering::Relaxed),
+        TRACE_WAIT[2].swap(0, Ordering::Relaxed),
+        WAITING.load(Ordering::Relaxed),
+        TRACE_WAIT[3].load(Ordering::Relaxed),
+        SKIPPED_BAD.load(Ordering::Relaxed),
+    ]
+}
 
 /// The keys of the pipelines the driver's compiler crashed or hung on
 /// (`warm-bad.txt` beside the pipeline library). Recorded entries use
@@ -348,6 +364,16 @@ fn lost(slot: usize) {
     let Some((p, screens_only)) = job else {
         return;
     };
+    TRACE_WAIT[3].fetch_add(1, Ordering::Relaxed);
+    if crate::host::trace_frame_on() {
+        eprintln!(
+            "[TEQUESTA][VEH] compiler_crashed key={} rip={:#x} addr={:#x} shaders={:?}",
+            p.key,
+            FAULT_RIP[slot].load(Ordering::Relaxed),
+            FAULT_ADDR[slot].load(Ordering::Relaxed),
+            p.shaders,
+        );
+    }
     tracing::error!(
         key = p.key,
         shaders = ?p.shaders,
@@ -391,6 +417,9 @@ fn lost(slot: usize) {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(why.into());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -547,6 +576,21 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    TRACE_WAIT[usize::from(screen)].fetch_add(elapsed_us, Ordering::Relaxed);
+    TRACE_WAIT[2].fetch_add(1, Ordering::Relaxed);
+    if elapsed_us >= 200_000 && crate::host::trace_frame_on() {
+        eprintln!(
+            "[TEQUESTA][PIPE_WAIT] waited={:.1}ms screen={} made={} queue={} veh={} bad={} shaders={:?}",
+            elapsed_us as f64 / 1000.0,
+            screen,
+            p.made.get().is_some(),
+            WAITING.load(Ordering::Relaxed),
+            TRACE_WAIT[3].load(Ordering::Relaxed),
+            SKIPPED_BAD.load(Ordering::Relaxed),
+            p.shaders,
+        );
+    }
     let waited = started.elapsed().min(left);
     waiting.end();
     if screen && waited > Duration::from_millis(500) {
