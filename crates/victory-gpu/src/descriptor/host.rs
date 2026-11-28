@@ -5228,6 +5228,10 @@ fn make_twinned(
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
+                let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if !*unordered || at == 0 {
+                    return None;
+                }
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
@@ -5237,7 +5241,6 @@ fn make_twinned(
                 static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
                 static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
                 if (said.len() < 64 && said.insert(at)) || times.is_power_of_two() {
                     tracing::warn!(
@@ -5659,6 +5662,9 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    if address == 0 {
+        return None;
+    }
     let words: Option<[u32; 10]> = desc[..10].try_into().ok();
     if *unordered {
         let texture = crate::resource::uav_texture_at(address, resource)?;

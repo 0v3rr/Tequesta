@@ -216,6 +216,30 @@ fn cached(
     cached_by(cache, build, SOURCE, container, translate, refresh)
 }
 
+/// Whether `dxil` declares a minimum wave size wider than the host supports
+/// (e.g. `WaveSize(64)` cached by an earlier translator on a 32-lane host).
+fn incompatible_wave(dxil: &[u8]) -> bool {
+    let host_max = victory_shader::emit::host_settings()[0];
+    if host_max == 0 {
+        return false;
+    }
+    let Ok(c) = victory_shader::Container::parse(dxil) else {
+        return false;
+    };
+    let Some(psv) = c.part(victory_shader::FourCC(*b"PSV0")) else {
+        return false;
+    };
+    if psv.data.len() < 28 {
+        return false;
+    }
+    let info_size = u32::from_le_bytes(psv.data[0..4].try_into().unwrap());
+    if info_size < 24 {
+        return false;
+    }
+    let wave_min = u32::from_le_bytes(psv.data[20..24].try_into().unwrap());
+    wave_min > host_max
+}
+
 /// [`cached`] with the build of the translator given (`source`).
 fn cached_by(
     cache: &Cache,
@@ -240,7 +264,7 @@ fn cached_by(
             let ran = converter.ran.load(Ordering::Relaxed);
             if !ran && made_by != source.as_bytes() {
                 STALE.fetch_add(1, Ordering::Relaxed);
-                if refresh && old.is_none() {
+                if (refresh || incompatible_wave(&shader.dxil)) && old.is_none() {
                     // Translated again in its place; what came out before
                     // is what the new one is compared with.
                     tracing::debug!(path = %path.display(), "shader cache entry of an earlier translator; translating again");
