@@ -965,7 +965,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 && let Some((stride, args)) = crate::signature::layout(sig)
                 && args.len() == 1
                 && stride > 0
-                && matches!(args[0][0], 0 | 1 | 2 | 10)
+                && matches!(args[0][0], 0 | 1 | 2 | 10 | 105)
             {
                 let mut fused = 1u64;
                 while fused < 64 && i < stream.len() {

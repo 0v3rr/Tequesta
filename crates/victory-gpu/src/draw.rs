@@ -5056,29 +5056,32 @@ impl State {
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// written them.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
-    ) -> bool {
+    ) -> IndirectResult {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
-            return false;
+            return IndirectResult::Dropped("skipped");
+        }
+        if max == 0 {
+            return IndirectResult::NoOp;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            return false;
+            return IndirectResult::Dropped("bvh builder off");
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
         if list.is_compute() && kind != DISPATCH {
-            return false;
+            return IndirectResult::Dropped("compute list non-dispatch");
         }
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
@@ -5087,11 +5090,8 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
-            return false;
+            return IndirectResult::Dropped("no host pipeline");
         };
-        if max == 0 {
-            return false;
-        }
         let compute_hash = if kind == DISPATCH {
             let hash = p.stages.first().map(|s| s.shader.hash.as_str()).unwrap_or("");
             if !hash.is_empty() && Self::skip_compute_hash(hash) {
@@ -5101,7 +5101,7 @@ impl State {
                     tracing::info!(hash, "skipping indirect compute dispatch via VICTORY_SKIP_COMPUTE_HASH");
                 }
                 DROPPED.fetch_add(1, Ordering::Relaxed);
-                return false;
+                return IndirectResult::Dropped("skip compute hash");
             }
             if max > 65_535 {
                 static ABSURD_IND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -5115,7 +5115,7 @@ impl State {
                     );
                 }
                 DROPPED.fetch_add(1, Ordering::Relaxed);
-                return false;
+                return IndirectResult::Dropped("absurd max count");
             }
             Some(hash)
         } else {
@@ -5149,19 +5149,19 @@ impl State {
                 "pipeline mismatch (compute {}, mesh {}, topology {})",
                 p.compute, p.mesh, self.topology
             ));
-            return false;
+            return IndirectResult::Dropped("pipeline mismatch");
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
-            return false;
+            return IndirectResult::Dropped("arguments outside title buffers");
         };
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
-                    return false;
+                    return IndirectResult::Dropped("count outside title buffers");
                 }
             },
             None => None,
@@ -5171,16 +5171,16 @@ impl State {
             .flatten()
         else {
             why("no host signature");
-            return false;
+            return IndirectResult::Dropped("no host signature");
         };
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
-            return false;
+            return IndirectResult::Dropped("mesh disabled");
         }
         let prof = crate::host::perf_trace_on();
         let t_clamp = prof.then(std::time::Instant::now);
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if batches() > 0 && max == 1 && count.is_none() && stride <= 20 {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -5254,7 +5254,7 @@ impl State {
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
+                    return IndirectResult::Dropped("clamp failed");
                 };
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
@@ -5283,7 +5283,7 @@ impl State {
         };
         if !ran {
             why("prepare failed");
-            return false;
+            return IndirectResult::Dropped("prepare failed");
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -5332,8 +5332,19 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
-        true
+        IndirectResult::Ran
     }
+}
+
+/// Outcome of [`State::execute_indirect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndirectResult {
+    /// Executed on the host command list.
+    Ran,
+    /// Valid zero-count (`max == 0`) call; nothing to execute and not a drop.
+    NoOp,
+    /// Could not run on the host, with a static reason for telemetry/logging.
+    Dropped(&'static str),
 }
 
 /// `DispatchX`: the counts are threads (the console's dispatch initiator bit

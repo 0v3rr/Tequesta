@@ -2291,40 +2291,58 @@ extern "system" fn execute_indirect(
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
-    let mut ran = false;
+    let mut drop_reason: Option<&'static str> = Some("unsupported platform");
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
-        && (count.is_null() || counter.is_some())
-    {
-        const DISPATCH: u32 = 2;
-        const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
-        });
-    } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
+    if args.len() != 1 {
+        drop_reason = Some("multi-arg signature");
+        #[cfg(feature = "diagnostics")]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
             address.is_some(),
             count.is_null() || counter.is_some()
         ));
+    } else if address.is_none() {
+        drop_reason = Some("arguments not a buffer");
+        #[cfg(feature = "diagnostics")]
+        crate::pipeline::note_why(format!(
+            "indirect signature {args:?}: arguments in a buffer false, count in a buffer {}",
+            count.is_null() || counter.is_some()
+        ));
+    } else if !count.is_null() && counter.is_none() {
+        drop_reason = Some("count not a buffer");
+        #[cfg(feature = "diagnostics")]
+        crate::pipeline::note_why(format!(
+            "indirect signature {args:?}: arguments in a buffer true, count in a buffer false"
+        ));
+    } else if let ([[kind, ..]], Some(address)) = (args, address) {
+        const DISPATCH: u32 = 2;
+        const DISPATCH_SINGLE: u32 = 105;
+        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        drop_reason = Some("no host list");
+        with_state(this, |list, s| {
+            drop_reason = match s.execute_indirect(list, (kind, stride, max), address, counter) {
+                crate::draw::IndirectResult::Ran | crate::draw::IndirectResult::NoOp => None,
+                crate::draw::IndirectResult::Dropped(reason) => Some(reason),
+            };
+        });
     }
-    if ran {
+    let Some(reason) = drop_reason else {
         return;
-    }
+    };
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    static SEEN: std::sync::Mutex<Vec<(usize, &'static str)>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&(signature as usize)) {
-        seen.push(signature as usize);
+    let key = (signature as usize, reason);
+    if !seen.contains(&key) {
+        seen.push(key);
         tracing::info!(
+            reason,
             stride,
             ?args,
             max,
             address = ?address.map(|a| format!("{a:#x}")),
             counted = !count.is_null(),
-            "indirect execution dropped (first time for this signature)"
+            "indirect execution dropped (first time for this signature and reason)"
         );
     }
 }
