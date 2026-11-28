@@ -337,7 +337,11 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     }
     // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
     // the console does not have it.
-    refuse(&file);
+    if load {
+        refuse(&file);
+    } else {
+        tracing::debug!(dll = file, "GetModuleHandle: module not loaded or outside host policy");
+    }
     host::set_last_error(ERROR_MOD_NOT_FOUND);
     Some(std::ptr::null_mut())
 }

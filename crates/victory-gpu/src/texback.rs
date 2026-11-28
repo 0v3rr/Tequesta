@@ -116,6 +116,9 @@ impl Target {
         let copy = crate::resource::host_copy(resource)?;
         let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
+        if !layout.addressable() {
+            return None;
+        }
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
         Some(Self { copy, layout, ticket })

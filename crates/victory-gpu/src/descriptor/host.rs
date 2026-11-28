@@ -4168,6 +4168,18 @@ pub(crate) fn buffer_copy_with_parent(
     u64,
     u64,
 )> {
+    if let &View::Constant(address, size) = view {
+        if crate::port_cbv::on() || size == 0 {
+            return None;
+        }
+        let len = u64::from(constant_bytes(size));
+        let parent = crate::shadow::find(address, u64::from(size))?;
+        if parent.gpu(address) % 256 == 0 {
+            return None;
+        }
+        let home = crate::shadow::exact(address, len, true)?;
+        return Some((home, Some(parent), address, len));
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -5008,13 +5020,22 @@ fn make_twinned(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
+            let mut shadow = crate::shadow::find(address, u64::from(size))?;
+            let mut gpu = shadow.gpu(address);
             if crate::port_cbv::on() {
                 // Renderer port 5: shaders read constant buffers as raw bytes
                 // through the twin; a constant buffer view there would be read
                 // raw, with no end on AMD.
                 return constant_twinned(&shadow.buffer, gpu, size, at, twin).then(|| Some(shadow.buffer.clone()));
+            }
+            if gpu % 256 != 0
+                && let Some(exact) = crate::shadow::exact(address, u64::from(constant_bytes(size)), true)
+            {
+                let exact_gpu = exact.gpu(address);
+                if exact_gpu % 256 == 0 {
+                    shadow = exact;
+                    gpu = exact_gpu;
+                }
             }
             if gpu % 256 != 0 {
                 once!(
