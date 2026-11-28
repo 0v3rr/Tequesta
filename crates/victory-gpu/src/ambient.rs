@@ -489,7 +489,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;
         stats.InterlockedAdd(0, 1, ignored);
-        stats.InterlockedAdd(4, uint(min(left, 1000.0) * 256.0), ignored);
+        stats.InterlockedAdd(4, uint(min(has, 1000.0) * 256.0), ignored);
         stats.InterlockedAdd(8, uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
         stats.InterlockedAdd(12, uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
     }

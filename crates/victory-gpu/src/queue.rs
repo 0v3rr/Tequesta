@@ -1251,10 +1251,27 @@ extern "system" fn desc(this: This, out: *mut QueueDesc) {
     }
 }
 
+/// `SuspendX(flags)`: drains queued and in-flight GPU work before suspend
+/// (older slot 21 / `0xa8`, newer Scarlett slot 23 / `0xb8`).
+extern "system" fn suspend_x(_this: This, _flags: u32) -> HRESULT {
+    #[cfg(windows)]
+    {
+        before_sync();
+        crate::host::settle_for_fence();
+    }
+    S_OK
+}
+
+/// `ResumeX()`: resumes a suspended command queue
+/// (older slot 22 / `0xb0`, newer Scarlett slot 24 / `0xc0`).
+extern "system" fn resume_x(_this: This) -> HRESULT {
+    S_OK
+}
+
 /// The queue methods by their slot in older titles' queues (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, queue 26 (12 as on PC,
 /// then console ones).
-const METHODS: [(usize, *const ()); 15] = [
+const METHODS: [(usize, *const ()); 17] = [
     (0, query as *const ()),
     (2, release as *const ()),
     (7, object::parent_device as *const ()), // 0x38
@@ -1265,6 +1282,8 @@ const METHODS: [(usize, *const ()); 15] = [
     (14, signal as *const ()),               // 0x70
     (15, wait as *const ()),                 // 0x78
     (16, timestamp_frequency as *const ()),  // 0x80
+    (21, suspend_x as *const ()),            // 0xa8 (newer 0xb8)
+    (22, resume_x as *const ()),             // 0xb0 (newer 0xc0)
     (26, desc as *const ()),                 // 0xd0
     (29, copy_page_mappings as *const ()),   // 0xe8 page mapping batch
     (30, present as *const ()),              // 0xf0
