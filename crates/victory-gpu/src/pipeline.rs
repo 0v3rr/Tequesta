@@ -822,12 +822,25 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Pipeline>(this)
 }
 
+/// Xbox Scarlett `ID3D12PipelineState` slot `0x58` (index 11): shader
+/// stats/scratch-memory query returning an `ID3DBlob*`. Callers (e.g.
+/// FidelityFX upscaler) handle `E_NOTIMPL` / null blob by treating
+/// scratch memory size as 0.
+extern "system" fn shader_stats(_this: This, _stage: u32, _flags: u32, out: *mut This) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: caller passes an out pointer for `ID3DBlob*`.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    object::E_NOTIMPL
+}
+
 /// IUnknown 3, object 4, device child 1, pipeline 3.
 static FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<PIPELINE, 24>());
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
+    f[11] = shader_stats as *const (); // 0x58
     Table(f)
 };
 

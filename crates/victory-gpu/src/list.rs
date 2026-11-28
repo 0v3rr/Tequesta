@@ -1475,7 +1475,20 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
+            let resolved_fmt = if crate::resource::stands_in(dst) {
+                a.Format.0 as u32
+            } else {
+                let f = crate::resource::pc_format(format);
+                let is_typeless = f != 0
+                    && crate::resource::family(f) == f
+                    && crate::resource::family(f + 1) == f;
+                if f == 0 || is_typeless {
+                    crate::resource::concrete_copy_format(a.Format.0 as u32)
+                } else {
+                    f
+                }
+            };
+            let format = DXGI_FORMAT(resolved_fmt as i32);
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
@@ -1610,6 +1623,64 @@ extern "system" fn clear_dsv(
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
+}
+
+fn clear_uav(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values_u32: [u32; 4],
+    is_float: bool,
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        let rects = (count > 0 && !rects.is_null()).then(|| {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        });
+        with_state(this, |list, s| {
+            s.clear_uav(list, gpu_handle, cpu_handle, resource, values_u32, is_float, rects)
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu_handle, cpu_handle, resource, values_u32, is_float, count, rects);
+}
+
+/// `ClearUnorderedAccessViewUint(gpu_handle, cpu_handle, resource, values, count, rects)`.
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four u32s (null is tolerated).
+    let Some(&values) = (unsafe { values.as_ref() }) else {
+        return;
+    };
+    clear_uav(this, gpu_handle, cpu_handle, resource, values, false, count, rects);
+}
+
+/// `ClearUnorderedAccessViewFloat(gpu_handle, cpu_handle, resource, values, count, rects)`.
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four f32s (null is tolerated).
+    let Some(&values) = (unsafe { values.as_ref() }) else {
+        return;
+    };
+    clear_uav(this, gpu_handle, cpu_handle, resource, values.map(f32::to_bits), true, count, rects);
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
@@ -2590,19 +2661,18 @@ fn barrier_groups_inner(this: This, count: u32, groups: *const u8, trusted: bool
                         if ((tb.access_before | tb.access_after) & UNORDERED_ACCESS) == 0 {
                             continue;
                         }
-                        let tex = if let Some(twin) = crate::resource::twin_resource(tb.resource) {
-                            Some(twin)
+                        if let Some(twin) = crate::resource::twin_resource(tb.resource) {
+                            list.keep(twin);
+                            let mut b = UAV_BARRIER;
+                            b.first = windows::core::Interface::as_raw(twin) as This;
+                            // SAFETY: `Barrier` matches `D3D12_RESOURCE_BARRIER`.
+                            legacy_uavs.push(unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(b) });
                         } else if let Some(copy) = crate::resource::host_copy(tb.resource)
                             && (copy.flags() & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32) != 0
                         {
-                            Some(unsafe { &*std::ptr::from_ref(&copy.texture) })
-                        } else {
-                            None
-                        };
-                        if let Some(tex) = tex {
-                            list.keep(tex);
+                            list.keep(&copy.texture);
                             let mut b = UAV_BARRIER;
-                            b.first = windows::core::Interface::as_raw(tex) as This;
+                            b.first = windows::core::Interface::as_raw(&copy.texture) as This;
                             // SAFETY: `Barrier` matches `D3D12_RESOURCE_BARRIER`.
                             legacy_uavs.push(unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(b) });
                         } else {
@@ -2823,7 +2893,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2864,6 +2934,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, state::depth_bounds as *const ()),       // 0x220 depth bounds

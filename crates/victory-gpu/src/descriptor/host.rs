@@ -3237,6 +3237,13 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// The CPU handle of slot `index`.
+    pub(crate) fn cpu_handle(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: self.cpu + usize::try_from(u64::from(index) * u64::from(self.step)).unwrap_or(0),
+        }
+    }
+
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         // SAFETY: a live shader-visible heap.
@@ -3945,21 +3952,26 @@ fn default_typed_uav_desc(
 }
 
 /// Clamps UAV mip and array/depth slice indices to the host texture's bounds.
+/// Returns `false` if the texture is multisampled or the UAV dimension does not
+/// match the resource dimension.
 fn clamp_uav_subresource(
     texture: &ID3D12Resource,
     desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC,
-) {
+) -> bool {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    if d.SampleDesc.Count > 1 {
+        return false;
+    }
     let max_mip = u32::from(d.MipLevels).saturating_sub(1);
     let max_slices = u32::from(d.DepthOrArraySize).max(1);
-    match desc.ViewDimension {
-        D3D12_UAV_DIMENSION_TEXTURE1D => {
+    match (d.Dimension, desc.ViewDimension) {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_UAV_DIMENSION_TEXTURE1D) => {
             // SAFETY: active union variant matches `ViewDimension`.
             let t = unsafe { &mut desc.Anonymous.Texture1D };
             t.MipSlice = t.MipSlice.min(max_mip);
         }
-        D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
             // SAFETY: active union variant matches `ViewDimension`.
             let t = unsafe { &mut desc.Anonymous.Texture1DArray };
             t.MipSlice = t.MipSlice.min(max_mip);
@@ -3969,12 +3981,12 @@ fn clamp_uav_subresource(
                 t.ArraySize = avail;
             }
         }
-        D3D12_UAV_DIMENSION_TEXTURE2D => {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2D) => {
             // SAFETY: active union variant matches `ViewDimension`.
             let t = unsafe { &mut desc.Anonymous.Texture2D };
             t.MipSlice = t.MipSlice.min(max_mip);
         }
-        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => {
             // SAFETY: active union variant matches `ViewDimension`.
             let t = unsafe { &mut desc.Anonymous.Texture2DArray };
             t.MipSlice = t.MipSlice.min(max_mip);
@@ -3984,7 +3996,7 @@ fn clamp_uav_subresource(
                 t.ArraySize = avail;
             }
         }
-        D3D12_UAV_DIMENSION_TEXTURE3D => {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_UAV_DIMENSION_TEXTURE3D) => {
             // SAFETY: active union variant matches `ViewDimension`.
             let t = unsafe { &mut desc.Anonymous.Texture3D };
             t.MipSlice = t.MipSlice.min(max_mip);
@@ -3995,8 +4007,9 @@ fn clamp_uav_subresource(
                 t.WSize = avail;
             }
         }
-        _ => {}
+        _ => return false,
     }
+    true
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -4546,6 +4559,237 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+pub(crate) struct ClearUavTarget {
+    pub(crate) resource: ID3D12Resource,
+    pub(crate) title_texture: Option<crate::object::This>,
+    pub(crate) shadow_write: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    pub(crate) float_ok: bool,
+}
+
+fn format_allows_float_clear(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format.0,
+        2 | 6
+            | 10
+            | 11
+            | 13
+            | 16
+            | 24
+            | 26
+            | 28
+            | 29
+            | 31
+            | 34
+            | 35
+            | 37
+            | 41
+            | 49
+            | 51
+            | 54
+            | 56
+            | 58
+            | 61
+            | 63
+            | 65
+            | 66
+            | 85
+            | 86
+            | 87
+            | 88
+            | 91
+            | 93
+            | 115
+    )
+}
+
+/// Creates identical host UAVs at `cpu_at` (non-shader-visible) and `gpu_cpu_at`
+/// (shader-visible dynamic slot) for `ClearUnorderedAccessViewUint`/`Float`.
+pub(crate) fn make_uav_for_clear(
+    view: &View,
+    cpu_at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    gpu_cpu_at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<ClearUavTarget> {
+    let host = host()?;
+    let placed = placed_texture(view);
+    let view = placed.as_ref().unwrap_or(view);
+    match view {
+        View::Unordered(r, _, desc) => {
+            let resource = *r as crate::object::This;
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                let mut desc = desc.as_ref().map(uav_desc);
+                let twin = crate::resource::twin_resource(resource)
+                    .and_then(|twin| Some((twin, twin_uav(twin, desc.as_ref())?)))
+                    .or_else(|| {
+                        let twin = crate::resource::twin_plane_resource(resource)?;
+                        Some((twin, twin_uav(twin, desc.as_ref())?))
+                    });
+                let texture = match twin {
+                    Some((twin, view)) => {
+                        desc = Some(view);
+                        twin
+                    }
+                    None => {
+                        if let Some(d) = &mut desc {
+                            if d.Format.0 == 0
+                                && let Some(own_fmt) = crate::resource::view_format(resource)
+                            {
+                                d.Format = DXGI_FORMAT(own_fmt as i32);
+                            }
+                            if !clamp_uav_subresource(texture, d) {
+                                return None;
+                            }
+                        } else if let Some(own_fmt) = crate::resource::view_format(resource) {
+                            desc = default_typed_uav_desc(texture, own_fmt);
+                        }
+                        texture
+                    }
+                };
+                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+                    return None;
+                }
+                let effective_fmt = desc
+                    .as_ref()
+                    .map(|d| d.Format)
+                    .filter(|f| f.0 != 0)
+                    // SAFETY: a live resource.
+                    .unwrap_or_else(|| unsafe { texture.GetDesc().Format });
+                let float_ok = format_allows_float_clear(effective_fmt);
+                // SAFETY: a live texture and two valid CPU descriptor slots.
+                unsafe {
+                    host.device.CreateUnorderedAccessView(
+                        texture,
+                        None::<&ID3D12Resource>,
+                        desc.as_ref().map(std::ptr::from_ref),
+                        cpu_at,
+                    );
+                    host.device.CreateUnorderedAccessView(
+                        texture,
+                        None::<&ID3D12Resource>,
+                        desc.as_ref().map(std::ptr::from_ref),
+                        gpu_cpu_at,
+                    );
+                }
+                Some(ClearUavTarget {
+                    resource: texture.clone(),
+                    title_texture: Some(resource),
+                    shadow_write: None,
+                    float_ok,
+                })
+            } else if let (Some((data, len)), Some(words)) =
+                (crate::resource::buffer_bytes(resource), desc)
+            {
+                make_buffer_uav_for_clear(host, data as u64, len, words, cpu_at, gpu_cpu_at)
+            } else {
+                None
+            }
+        }
+        View::Placed(true, resource, desc) if resource[0] == 1 => {
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            if len == 0 {
+                return None;
+            }
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let words: &[u32; 10] = desc[..10].try_into().ok()?;
+            make_buffer_uav_for_clear(host, address, len, words, cpu_at, gpu_cpu_at)
+        }
+        _ => None,
+    }
+}
+
+fn make_buffer_uav_for_clear(
+    host: &crate::host::Host,
+    address: u64,
+    len: u64,
+    words: &[u32; 10],
+    cpu_at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    gpu_cpu_at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<ClearUavTarget> {
+    let (write_addr, write_len) = unordered_range(address, words)?;
+    let mut desc = uav_desc(words);
+    let mut shadow = crate::shadow::find(address, len)?;
+    let unit = {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        if b.StructureByteStride > 0 {
+            u64::from(b.StructureByteStride)
+        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        }
+    };
+    // SAFETY: a buffer view's union member.
+    let own = unsafe { &mut desc.Anonymous.Buffer };
+    let start = address + own.FirstElement * unit;
+    let kind = (
+        own.StructureByteStride,
+        own.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0,
+        desc.Format.0 as u32,
+    );
+    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
+    let mut address = address;
+    if !std::sync::Arc::ptr_eq(&home, &shadow) {
+        (shadow, address) = (home, start);
+        own.FirstElement = 0;
+    }
+    // SAFETY: a live buffer.
+    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        return None;
+    }
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let element = if buffer.StructureByteStride > 0 {
+        u64::from(buffer.StructureByteStride)
+    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        4
+    } else {
+        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    };
+    let offset = shadow.offset(address);
+    let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
+        .then(|| raw_window(offset, buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride))
+        .flatten();
+    if let Some((first, count)) = window {
+        buffer.FirstElement = first;
+        buffer.NumElements = count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    } else {
+        if element == 0 || offset % element != 0 {
+            return None;
+        }
+        buffer.FirstElement += offset / element;
+    }
+    buffer.CounterOffsetInBytes = 0;
+    let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    // D3D12 ClearUnorderedAccessView* is invalid on structured buffer UAVs.
+    if stride > 0 {
+        return None;
+    }
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+        return None;
+    }
+    let float_ok = !raw && format_allows_float_clear(desc.Format);
+    // SAFETY: a live buffer and two valid CPU descriptor slots.
+    unsafe {
+        host.device
+            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), cpu_at);
+        host.device
+            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), gpu_cpu_at);
+    }
+    Some(ClearUavTarget {
+        resource: shadow.buffer.clone(),
+        title_texture: None,
+        shadow_write: Some((shadow, write_addr, write_len)),
+        float_ok,
+    })
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -4578,13 +4822,18 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     // Every family has more than one format, its typeless one first.
     let typeless = family(own) == own && family(own + 1) == own;
-    if let Some(format) = format.as_deref_mut()
-        && unordered
-        && let Some(&(_, linear)) = crate::resource::SRGB
-            .iter()
-            .find(|&&(s, _)| s == format.0 as u32)
-    {
-        format.0 = linear as i32;
+    if let Some(format) = format.as_deref_mut() {
+        let f = format.0 as u32;
+        if f != 0 && family(f) == f && family(f + 1) == f {
+            format.0 = crate::resource::concrete_copy_format(f) as i32;
+        }
+        if unordered
+            && let Some(&(_, linear)) = crate::resource::SRGB
+                .iter()
+                .find(|&&(s, _)| s == format.0 as u32)
+        {
+            format.0 = linear as i32;
+        }
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
@@ -4933,7 +5182,9 @@ fn make_twinned(
                         {
                             d.Format = DXGI_FORMAT(own_fmt as i32);
                         }
-                        clamp_uav_subresource(texture, d);
+                        if !clamp_uav_subresource(texture, d) {
+                            return None;
+                        }
                     } else if let Some(own_fmt) = crate::resource::view_format(resource) {
                         desc = default_typed_uav_desc(texture, own_fmt);
                     }

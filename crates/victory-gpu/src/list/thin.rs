@@ -526,6 +526,8 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const CLEAR_UAV_UINT: u64 = after(17);
+const CLEAR_UAV_FLOAT: u64 = after(18);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -560,6 +562,18 @@ fn record(handle: u64) -> [u64; RECORD] {
     words
 }
 const RECORD: usize = size_of::<RtvRecord>().div_ceil(8);
+const VIEW_WORDS: usize = 4;
+
+fn view_snapshot(handle: u64) -> [u64; VIEW_WORDS] {
+    let mut words = [0u64; VIEW_WORDS];
+    if handle != 0 {
+        // SAFETY: a view descriptor slot is 32 bytes (4 u64 words).
+        unsafe {
+            std::ptr::copy_nonoverlapping(handle as *const u8, words.as_mut_ptr().cast(), VIEW_WORDS * 8)
+        };
+    }
+    words
+}
 
 extern "system" fn list_close(this: This) -> HRESULT {
     front(this).close();
@@ -754,6 +768,70 @@ extern "system" fn clear_dsv(
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
+fn record_clear_uav(
+    this: This,
+    op: u64,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    vals: [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    let count = if rects.is_null() { 0 } else { count };
+    let view = view_snapshot(cpu_handle);
+    front(this).put_with(
+        op,
+        &[
+            u64::from(count),
+            gpu_handle,
+            resource as u64,
+            u64::from(cpu_handle != 0),
+            u64::from(vals[0]) | u64::from(vals[1]) << 32,
+            u64::from(vals[2]) | u64::from(vals[3]) << 32,
+        ],
+        &[bytes_of(view.as_ptr(), VIEW_WORDS), bytes_of(rects, count as usize)],
+    );
+}
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four u32s (null is tolerated).
+    let Some(&vals) = (unsafe { values.as_ref() }) else {
+        return;
+    };
+    record_clear_uav(this, CLEAR_UAV_UINT, gpu_handle, cpu_handle, resource, vals, count, rects);
+}
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four f32s (null is tolerated).
+    let Some(&vals) = (unsafe { values.as_ref() }) else {
+        return;
+    };
+    record_clear_uav(
+        this,
+        CLEAR_UAV_FLOAT,
+        gpu_handle,
+        cpu_handle,
+        resource,
+        vals.map(f32::to_bits),
+        count,
+        rects,
+    );
+}
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -831,6 +909,8 @@ fn translate_bucket(op: u64) -> usize {
                 | TARGETS
                 | CLEAR_RTV
                 | CLEAR_DSV
+                | CLEAR_UAV_UINT
+                | CLEAR_UAV_FLOAT
         )
     {
         4
@@ -1022,6 +1102,42 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                         at(w, 3 + RECORD, n),
                     );
                 }
+                CLEAR_UAV_UINT => {
+                    let vals = [
+                        w[4] as u32,
+                        (w[4] >> 32) as u32,
+                        w[5] as u32,
+                        (w[5] >> 32) as u32,
+                    ];
+                    let cpu_handle = if w[3] != 0 { w[6..].as_ptr() as u64 } else { 0 };
+                    super::clear_uav_uint(
+                        list,
+                        w[1],
+                        cpu_handle,
+                        w[2] as This,
+                        &vals,
+                        n as u32,
+                        at(w, 6 + VIEW_WORDS, n),
+                    );
+                }
+                CLEAR_UAV_FLOAT => {
+                    let vals = [
+                        f32::from_bits(w[4] as u32),
+                        f32::from_bits((w[4] >> 32) as u32),
+                        f32::from_bits(w[5] as u32),
+                        f32::from_bits((w[5] >> 32) as u32),
+                    ];
+                    let cpu_handle = if w[3] != 0 { w[6..].as_ptr() as u64 } else { 0 };
+                    super::clear_uav_float(
+                        list,
+                        w[1],
+                        cpu_handle,
+                        w[2] as This,
+                        &vals,
+                        n as u32,
+                        at(w, 6 + VIEW_WORDS, n),
+                    );
+                }
                 COPY_TEXTURE => {
                     let step = size_of::<CopyLocation>().div_ceil(8);
                     let boxed = (w[1] >> 32) as usize;
@@ -1064,7 +1180,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 52] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -1100,6 +1216,8 @@ const MINE: [(usize, *const ()); 50] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (53, clear_uav_uint as *const ()),
+    (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),
     (60, copy_memory as *const ()),
     (68, depth_bounds as *const ()),

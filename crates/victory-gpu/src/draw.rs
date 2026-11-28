@@ -1510,6 +1510,132 @@ impl State {
         }
     }
 
+    fn ensure_heaps_bound(&mut self, list: &HostList) {
+        // Heaps first: a root signature with directly indexed heaps must be
+        // set after them, with both a view heap and a sampler heap bound.
+        // (`VICTORY_FALLBACK_HEAPS=1`, codec-d/cool_fox 641835a4: a host
+        // heap of one slot for one the title did not set; else only those it
+        // set, as before.)
+        let fallback = crate::host::fallback_heaps();
+        if (fallback && !self.host_heaps_set) || self.host_heaps != self.heaps {
+            let mut view_heap: Option<ID3D12DescriptorHeap> = None;
+            let mut sampler_heap: Option<ID3D12DescriptorHeap> = None;
+            for &h in &self.heaps {
+                if h == 0 {
+                    continue;
+                }
+                let title_heap = crate::descriptor::heap(h as This);
+                if let Some(host_heap) = title_heap.host() {
+                    if title_heap.samplers() {
+                        sampler_heap = Some(host_heap.heap.clone());
+                    } else {
+                        view_heap = Some(host_heap.heap.clone());
+                    }
+                }
+            }
+            if fallback && view_heap.is_none() {
+                view_heap = crate::host::host().and_then(|h| h.fallback_view_heap().cloned());
+            }
+            if fallback && sampler_heap.is_none() {
+                sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
+            }
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut heaps_len = 0usize;
+            if let Some(h) = view_heap {
+                list.keep(&h);
+                heaps[heaps_len] = Some(h);
+                heaps_len += 1;
+            }
+            if let Some(h) = sampler_heap {
+                list.keep(&h);
+                heaps[heaps_len] = Some(h);
+                heaps_len += 1;
+            }
+            if heaps_len > 0 {
+                // SAFETY: an open list and shader-visible heaps.
+                unsafe { list.list.SetDescriptorHeaps(&heaps[..heaps_len]) };
+            }
+            self.host_heaps = self.heaps;
+            self.host_heaps_set = true;
+            self.host_roots = [0; 2];
+            self.invalidate_bound_roots(0);
+            self.invalidate_bound_roots(1);
+        }
+    }
+
+    pub(crate) fn clear_uav(
+        &mut self,
+        list: &HostList,
+        gpu_handle: u64,
+        cpu_handle: u64,
+        resource: This,
+        values_u32: [u32; 4],
+        is_float: bool,
+        rects: Option<&[RECT]>,
+    ) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Some(view) = crate::descriptor::view(cpu_handle)
+            .or_else(|| crate::descriptor::view(gpu_handle))
+            .or_else(|| (!resource.is_null()).then_some(View::Unordered(resource as usize, 0, None)))
+        else {
+            return;
+        };
+        let heap_ptr = self.heaps[0];
+        if heap_ptr == 0 {
+            return;
+        }
+        let title_heap = crate::descriptor::heap(heap_ptr as This);
+        let Some(host_heap) = title_heap.host() else {
+            return;
+        };
+        self.ensure_heaps_bound(list);
+        let Some(slot) = self.alloc_dynamic(heap_ptr, host_heap, 1) else {
+            return;
+        };
+        let gpu_cpu_at = host_heap.cpu_handle(slot);
+        let gpu_at = host_heap.gpu_handle(slot);
+        let cpu_at = host.uav_cpu();
+        let Some(target) = crate::descriptor::host::make_uav_for_clear(&view, cpu_at, gpu_cpu_at)
+        else {
+            return;
+        };
+        list.keep(&target.resource);
+        if let Some(tex) = target.title_texture {
+            list.texture_written(tex);
+            if !list.twin_use(tex, true, true) {
+                const UNORDERED_ACCESS: u32 = 0x8;
+                crate::list::ensure_state(list, tex, UNORDERED_ACCESS);
+            }
+        }
+        if let Some((shadow, addr, len)) = target.shadow_write {
+            shadow.gpu_writes(list, addr, len);
+        }
+        let rects = if target.title_texture.is_some() {
+            rects.unwrap_or(&[])
+        } else {
+            &[]
+        };
+        // SAFETY: `gpu_at` is in the currently bound shader-visible view heap, `cpu_at`
+        // is in our non-shader-visible heap, and `target.resource` is kept alive.
+        unsafe {
+            if is_float && target.float_ok {
+                let vals = values_u32.map(f32::from_bits);
+                list.list
+                    .ClearUnorderedAccessViewFloat(gpu_at, cpu_at, &target.resource, &vals, rects);
+            } else {
+                list.list.ClearUnorderedAccessViewUint(
+                    gpu_at,
+                    cpu_at,
+                    &target.resource,
+                    &values_u32,
+                    rects,
+                );
+            }
+        }
+    }
+
     pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
         let c_idx = usize::from(compute);
         self.tables_gen[c_idx] += 1;
@@ -2071,56 +2197,7 @@ impl State {
             once!("a dispatch without a view heap that needs one gets the title's");
             self.heaps[0] = heap;
         }
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them, with both a view heap and a sampler heap bound.
-        // (`VICTORY_FALLBACK_HEAPS=1`, codec-d/cool_fox 641835a4: a host
-        // heap of one slot for one the title did not set; else only those it
-        // set, as before.)
-        let fallback = crate::host::fallback_heaps();
-        if (fallback && !self.host_heaps_set) || self.host_heaps != self.heaps {
-            let mut view_heap: Option<ID3D12DescriptorHeap> = None;
-            let mut sampler_heap: Option<ID3D12DescriptorHeap> = None;
-            for &h in &self.heaps {
-                if h == 0 {
-                    continue;
-                }
-                let title_heap = crate::descriptor::heap(h as This);
-                if let Some(host_heap) = title_heap.host() {
-                    if title_heap.samplers() {
-                        sampler_heap = Some(host_heap.heap.clone());
-                    } else {
-                        view_heap = Some(host_heap.heap.clone());
-                    }
-                }
-            }
-            if fallback && view_heap.is_none() {
-                view_heap = crate::host::host().and_then(|h| h.fallback_view_heap().cloned());
-            }
-            if fallback && sampler_heap.is_none() {
-                sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
-            }
-            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
-            let mut heaps_len = 0usize;
-            if let Some(h) = view_heap {
-                list.keep(&h);
-                heaps[heaps_len] = Some(h);
-                heaps_len += 1;
-            }
-            if let Some(h) = sampler_heap {
-                list.keep(&h);
-                heaps[heaps_len] = Some(h);
-                heaps_len += 1;
-            }
-            if heaps_len > 0 {
-                // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps[..heaps_len]) };
-            }
-            self.host_heaps = self.heaps;
-            self.host_heaps_set = true;
-            self.host_roots = [0; 2];
-            self.invalidate_bound_roots(0);
-            self.invalidate_bound_roots(1);
-        }
+        self.ensure_heaps_bound(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
